@@ -5,6 +5,25 @@ use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{lnurl::LnUrl, Builder, LnUrlResponse};
 use std::str::FromStr;
 
+/// Keep a genuine transport failure typed as [`Error::HTTP`], so the cause
+/// under it survives, and do not claim the label for the rest.
+///
+/// `lnurl::Error` covers the whole client, not just its socket: `InvalidLnUrl`,
+/// `HttpResponse(404)` and `Json` are answers, not failures to reach anyone,
+/// and `Error::HTTP` now means specifically "no usable response came back".
+/// Only `Reqwest` is that, and it carries the same `reqwest::Error` this
+/// crate's own requests produce — lnurl-rs and this crate resolve to one
+/// `reqwest`.
+///
+/// The others fold to text as before. Note that `lnurl::Error` renders through
+/// `Debug`, so `HttpResponse(404)` reads as `HttpResponse(404)`.
+fn from_lnurl_error(e: lnurl::Error) -> Error {
+    match e {
+        lnurl::Error::Reqwest(e) => Error::HTTP(Box::new(e)),
+        other => Error::Generic(other.to_string()),
+    }
+}
+
 pub fn validate_lnurl(string: &str) -> bool {
     let string = string.to_lowercase();
     LnUrl::from_str(&string).is_ok() || LightningAddress::from_str(&string).is_ok()
@@ -26,14 +45,14 @@ pub async fn fetch_invoice(address: &str, amount_msats: u64) -> Result<String, E
     let res = client
         .make_request(&lnurl.url)
         .await
-        .map_err(|e| Error::HTTP(e.to_string()))?;
+        .map_err(from_lnurl_error)?;
 
     match res {
         LnUrlResponse::LnUrlPayResponse(pay) => {
             let pay_result = client
                 .get_invoice(&pay, amount_msats, None, None)
                 .await
-                .map_err(|e| Error::HTTP(e.to_string()))?;
+                .map_err(from_lnurl_error)?;
             let invoice = Bolt11Invoice::from_str(pay_result.invoice()).map_err(Error::Bolt11)?;
 
             if invoice.amount_milli_satoshis() != Some(amount_msats) {
@@ -59,7 +78,7 @@ pub async fn create_withdraw_response(voucher: &str) -> Result<WithdrawalRespons
     let res = client
         .make_request(&lnurl.url)
         .await
-        .map_err(|e| Error::HTTP(e.to_string()))?;
+        .map_err(from_lnurl_error)?;
 
     match res {
         LnUrlResponse::LnUrlWithdrawResponse(withdraw) => Ok(withdraw),
@@ -75,7 +94,7 @@ pub async fn process_withdrawal(withdraw: &WithdrawalResponse, invoice: &str) ->
     client
         .do_withdrawal(withdraw, invoice)
         .await
-        .map_err(|e| Error::HTTP(e.to_string()))?;
+        .map_err(from_lnurl_error)?;
 
     Ok(())
 }

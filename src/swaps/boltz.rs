@@ -4040,9 +4040,13 @@ mod tests {
             // deserialize becomes `HTTPResponseBodyInvalid` or `JSON`. So this
             // variant means the request never came back — refused, DNS, TLS, or
             // the timeout above — and the SDK is not what is under test.
-            Err(Error::HTTP(detail)) => {
+            Err(error @ Error::HTTP(_)) => {
                 // Announced, not silent: a run where every live test skipped
-                // must not read like one where they all passed.
+                // must not read like one where they all passed. With the
+                // causes, because reqwest's own layer only says a request was
+                // sent, and which of refused / DNS / TLS / timed out it was is
+                // the whole content of a skip line.
+                let detail = error.message_with_causes();
                 eprintln!("SKIPPED {what}: {base_url} did not answer ({detail})");
                 None
             }

@@ -20,7 +20,19 @@ pub enum Error {
     Sighash(bitcoin::sighash::TaprootError),
     ElSighash(elements::sighash::Error),
     Secp(bitcoin::secp256k1::Error),
-    HTTP(String),
+    /// A request that never produced a usable response: connection refused,
+    /// DNS failure, a rejected certificate, a timeout, or a body this client
+    /// could not read.
+    ///
+    /// Holds the error rather than its text because the actionable part is in
+    /// that error's *cause*, not its own `Display`, which renders only its own
+    /// layer — "error sending request for url (…)" — and says nothing about
+    /// why. [`Error::source`](std::error::Error::source) reaches the rest, and
+    /// [`Error::message_with_causes`] folds it into one string for a surface
+    /// that can carry only text.
+    ///
+    /// Boxed to keep this enum small, as [`Error::WebSocket`] is.
+    HTTP(Box<reqwest::Error>),
     JSON(serde_json::Error),
     IO(std::io::Error),
     Bolt11(lightning_invoice::ParseOrSemanticError),
@@ -119,7 +131,7 @@ impl From<bitcoin::secp256k1::Error> for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(value: reqwest::Error) -> Self {
-        Self::HTTP(value.to_string())
+        Self::HTTP(Box::new(value))
     }
 }
 
@@ -355,6 +367,28 @@ impl Error {
             }
         }
     }
+
+    /// [`Error::message`] followed by every cause below it, `: ` apart.
+    ///
+    /// For a surface that can carry only a string — a UniFFI enum, a
+    /// `js_sys::Error`, a log line — and so cannot walk
+    /// [`source`](std::error::Error::source) itself. A Rust caller reporting a
+    /// chain (`anyhow`, `eyre`, Sentry) already gets these layers separately
+    /// and wants [`Error::message`] instead.
+    ///
+    /// [`Error::HTTP`] is what this exists for: its message is reqwest's own
+    /// layer, and "connection refused" is a cause underneath it. Variants with
+    /// no cause return exactly [`Error::message`].
+    pub fn message_with_causes(&self) -> String {
+        let mut rendered = self.message();
+        let mut cause = std::error::Error::source(self);
+        while let Some(next) = cause {
+            rendered.push_str(": ");
+            rendered.push_str(&next.to_string());
+            cause = next.source();
+        }
+        rendered
+    }
 }
 
 impl Display for Error {
@@ -386,8 +420,11 @@ impl Display for Error {
 /// `ConfidentialTxOutError` have empty `std::error::Error` impls, while
 /// `elements::encode::Error` overrides only the deprecated `cause`, which
 /// `source`'s default does not delegate to. Where the old impl answered `Some`
-/// for these it was handing back a pure duplicate, so nothing is lost. `BIP32`
-/// and `BitcoinEncode` are the two that genuinely go deeper.
+/// for these it was handing back a pure duplicate, so nothing is lost. `HTTP`,
+/// `BIP32` and `BitcoinEncode` are the three that genuinely go deeper, and
+/// `HTTP` is the one where it matters operationally: reqwest renders only its
+/// own layer, so "connection refused", "dns error" and "certificate verify
+/// failed" all live below it.
 ///
 /// Resist "fixing" the flat ones by reaching inside. `elements::encode::Error`'s
 /// `Secp256k1zkp` payload, for instance, is rendered by that error's own
@@ -402,6 +439,14 @@ impl Display for Error {
 /// `String` variants because whatever produced them was flattened at the
 /// conversion site. Every one of them still carries its text in this error's own
 /// `Display`.
+///
+/// The remaining `String` variants stay flattened for a structural reason, not
+/// an accidental one: each is a *category* fed by several unrelated upstream
+/// types — `Hex` by four, `Taproot` by four, `Address`, `Blind`, `Locktime` and
+/// `Musig2` by two or three — so there is no one concrete error a variant could
+/// hold. Giving them a chain needs a `Box<dyn Error>` payload, which trades the
+/// typed access `HTTP` has for a cause chain; `HTTP` did not have to make that
+/// trade, being fed by exactly one type.
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -412,6 +457,7 @@ impl std::error::Error for Error {
             Error::Sighash(e) => e.source(),
             Error::ElSighash(e) => e.source(),
             Error::Secp(e) => e.source(),
+            Error::HTTP(e) => e.as_ref().source(),
             Error::JSON(e) => e.source(),
             Error::IO(e) => e.source(),
             Error::LiquidEncode(e) => e.source(),
@@ -430,7 +476,6 @@ impl std::error::Error for Error {
             Error::Hex(_)
             | Error::Protocol(_)
             | Error::Address(_)
-            | Error::HTTP(_)
             | Error::Bolt11(_)
             | Error::Blind(_)
             | Error::BIP85(_)
@@ -462,6 +507,25 @@ mod tests {
         rendered
     }
 
+    /// A `reqwest::Error` that has a cause and cost no I/O to produce.
+    ///
+    /// A URL this client cannot parse fails in the builder, before a socket is
+    /// opened, and reqwest keeps the `url::ParseError` underneath as its
+    /// source. That makes it the one reqwest error a unit test can construct
+    /// offline while still having two layers, which is what the guards over
+    /// [`wrapped_variants`] need.
+    ///
+    /// It is not the interesting *kind* — a refused connection is — but the
+    /// kind does not change the plumbing: every one of them carries its detail
+    /// in `source`, and [`a_refused_connection_reports_why_it_failed`]
+    /// exercises one for real.
+    fn unsent_request_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("an unparseable URL must fail in the builder")
+    }
+
     /// One of each variant that wraps a concrete error, paired with the text
     /// that error renders on its own — captured before it was moved in.
     ///
@@ -481,6 +545,7 @@ mod tests {
                 Error::JSON,
             ),
             pair(url::Url::parse("not a url").unwrap_err(), Error::Url),
+            pair(unsent_request_error(), |e| Error::HTTP(Box::new(e))),
             pair(
                 bitcoin::secp256k1::PublicKey::from_str("00").unwrap_err(),
                 Error::Secp,
@@ -630,7 +695,7 @@ mod tests {
             Error::Bolt11(lightning_invoice::Bolt11Invoice::from_str("nonsense").unwrap_err()),
             Error::BIP85(bip85_extended::Error::InvalidWordCount(7)),
             Error::Generic("flattened".to_string()),
-            Error::HTTP("error sending request".to_string()),
+            Error::Hex("odd hex string length".to_string()),
             Error::Protocol("not a key".to_string()),
             Error::LiquidFeeAssetRequired,
             Error::HTTPStatusNotSuccess(
@@ -651,6 +716,117 @@ mod tests {
                 error.name()
             );
         }
+    }
+
+    /// `HTTP` is the variant this matters most for, and the one with the least
+    /// to show without it: reqwest's `Display` renders its own layer only —
+    /// "error sending request for url (…)", or "builder error" here — and the
+    /// reason is a cause underneath.
+    ///
+    /// Pinned structurally rather than by wording: the cause is reachable, and
+    /// what it says is not already in this error's own message. The upstream
+    /// text belongs to `reqwest`/`url` under caret requirements and is theirs
+    /// to reword.
+    #[test]
+    fn a_failed_request_reaches_the_cause_reqwest_does_not_render() {
+        let error = Error::HTTP(Box::new(unsent_request_error()));
+        let rendered = chain(&error);
+
+        assert!(
+            rendered.len() >= 2,
+            "no cause below the request error: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .skip(1)
+                .any(|below| !error.message().contains(below.as_str())),
+            "every layer only repeats what the message already said: {rendered:?}"
+        );
+    }
+
+    /// What the variant holding the error buys beyond a chain: reqwest's own
+    /// classification, which a `String` could not answer at all.
+    ///
+    /// `is_connect` walks reqwest's source chain internally, so it is also a
+    /// second reader of the causes this change stopped discarding.
+    #[test]
+    fn a_failed_request_keeps_reqwests_own_classification() {
+        let Error::HTTP(error) = Error::from(unsent_request_error()) else {
+            panic!("From<reqwest::Error> must produce Error::HTTP");
+        };
+        assert!(error.is_builder(), "the builder failure was reclassified");
+        assert!(
+            !error.is_connect(),
+            "a builder failure is not a connect one"
+        );
+    }
+
+    /// The refused connection the variant exists for, end to end.
+    ///
+    /// Loopback on a port nothing listens on: no name to resolve, no external
+    /// host, and a refusal that arrives immediately — nothing here can hang or
+    /// depend on a third party. `is_connect` is asserted first so a failure for
+    /// some *other* reason cannot pass as this one.
+    ///
+    /// Native-only, like every other test here that opens a socket: the wasm
+    /// harness runs in a browser, where a fetch to a dead loopback port fails
+    /// through the JS layer rather than as a connect error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[macros::async_test]
+    async fn a_refused_connection_reports_why_it_failed() {
+        let refused = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on loopback port 1");
+        assert!(
+            refused.is_connect(),
+            "not a connect failure, so this test proves nothing: {refused:?}"
+        );
+
+        let error = Error::from(refused);
+        let rendered = chain(&error);
+        assert!(
+            rendered.len() >= 2,
+            "the refusal is not reachable below reqwest's own layer: {rendered:?}"
+        );
+        assert!(
+            error.message_with_causes().len() > error.message().len(),
+            "a string-only surface still sees nothing but {:?}",
+            error.message()
+        );
+    }
+
+    /// [`Error::message_with_causes`] is the whole chain, `: ` apart, for the
+    /// surfaces that cannot walk it — `bindings` maps `HTTP` through it.
+    ///
+    /// Stated against [`chain`] rather than against fixed text, so upstream
+    /// rewording moves both sides together. What is pinned is the contract: it
+    /// starts with [`Error::message`], it adds every layer below, and it adds
+    /// nothing when there is no layer below.
+    #[test]
+    fn message_with_causes_folds_the_chain_and_message_still_does_not() {
+        for (error, wrapped) in wrapped_variants() {
+            let rendered = chain(&error);
+            assert_eq!(
+                error.message_with_causes(),
+                rendered.join(": "),
+                "{} folded its chain wrong",
+                error.name()
+            );
+            assert!(
+                error.message_with_causes().starts_with(&error.message()),
+                "{} does not lead with its own message",
+                error.name()
+            );
+            // The half of the contract `message` owns: folding is opt-in, and
+            // does not leak into what `Display` renders.
+            assert_eq!(error.message(), wrapped);
+        }
+
+        let flat = Error::Generic("nothing below this".to_string());
+        assert_eq!(flat.message_with_causes(), flat.message());
     }
 
     /// The reason the impl exists at all: `?` lifting into the two result types

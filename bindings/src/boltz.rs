@@ -35,7 +35,11 @@ pub enum Error {
 impl From<CoreError> for Error {
     fn from(err: CoreError) -> Self {
         match err {
-            CoreError::HTTP(s) => Error::Http(s),
+            // `message_with_causes`, not `message`: this surface is a string
+            // and cannot walk the source chain, and for a request failure the
+            // useful half — "connection refused", "dns error" — is a cause
+            // below reqwest's own layer.
+            CoreError::HTTP(_) => Error::Http(err.message_with_causes()),
             CoreError::LiquidFeeAssetRequired => Error::LiquidFeeAssetRequired,
             _ => Error::Generic(err.message()),
         }
