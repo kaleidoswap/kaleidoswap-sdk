@@ -379,13 +379,29 @@ impl Display for Error {
 /// error" printed twice into "base58 encoding error" caused by "incorrect
 /// checksum".
 ///
-/// The arms answering `None` are enumerated rather than left to a wildcard, so a
-/// new variant wrapping a concrete error has to make a choice here — the way it
-/// already must in [`Error::name`] and [`Error::message`] — instead of silently
-/// losing its cause. `Bolt11` and `BIP85` report none because their upstream
-/// types do not implement `std::error::Error` at all, and the `String` variants
-/// because whatever produced them was flattened at the conversion site. Every
-/// one of them still carries its text in this error's own `Display`.
+/// Most of the forwarding arms below answer `None` in practice, and that is the
+/// correct answer rather than a gap: `serde_json::Error`, `url::ParseError`,
+/// `secp256k1::Error`, `bip39::Error` and a syscall `io::Error` have no cause of
+/// their own, and `electrum_client::Error`, `elements::sighash::Error` and
+/// `ConfidentialTxOutError` have empty `std::error::Error` impls, while
+/// `elements::encode::Error` overrides only the deprecated `cause`, which
+/// `source`'s default does not delegate to. Where the old impl answered `Some`
+/// for these it was handing back a pure duplicate, so nothing is lost. `BIP32`
+/// and `BitcoinEncode` are the two that genuinely go deeper.
+///
+/// Resist "fixing" the flat ones by reaching inside. `elements::encode::Error`'s
+/// `Secp256k1zkp` payload, for instance, is rendered by that error's own
+/// `Display` — returning it as the cause would reintroduce exactly the
+/// duplication this forwarding removes.
+///
+/// The arms answering `None` unconditionally are enumerated rather than left to
+/// a wildcard, so a new variant wrapping a concrete error has to make a choice
+/// here — the way it already must in [`Error::name`] and [`Error::message`] —
+/// instead of silently losing its cause. `Bolt11` and `BIP85` are there because
+/// their upstream types do not implement `std::error::Error` at all, and the
+/// `String` variants because whatever produced them was flattened at the
+/// conversion site. Every one of them still carries its text in this error's own
+/// `Display`.
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -446,44 +462,79 @@ mod tests {
         rendered
     }
 
-    /// One of each variant that wraps a concrete error, built from a real
-    /// failure rather than a constructed one.
-    fn wrapped_variants() -> Vec<Error> {
+    /// One of each variant that wraps a concrete error, paired with the text
+    /// that error renders on its own — captured before it was moved in.
+    ///
+    /// The pairing is the point. Asserting `to_string() == message()` would be
+    /// true by construction, since `Display` *is* `message`; comparing against
+    /// the wrapped error's own text is what lets the guard below fail if a
+    /// `message` arm ever starts adding or dropping something.
+    fn wrapped_variants() -> Vec<(Error, String)> {
+        fn pair<E: std::fmt::Display>(inner: E, wrap: impl FnOnce(E) -> Error) -> (Error, String) {
+            let rendered = inner.to_string();
+            (wrap(inner), rendered)
+        }
         use bitcoin::hashes::Hash as _;
         vec![
-            Error::JSON(serde_json::from_str::<serde_json::Value>("{oops").unwrap_err()),
-            Error::Url(url::Url::parse("not a url").unwrap_err()),
-            Error::Secp(bitcoin::secp256k1::PublicKey::from_str("00").unwrap_err()),
-            Error::Key(bitcoin::PublicKey::from_str("zz").unwrap_err()),
-            Error::Hash(bitcoin::hashes::sha256::Hash::from_slice(&[1, 2, 3]).unwrap_err()),
-            Error::BIP32(bitcoin::bip32::Xpriv::from_str("xprvBAD").unwrap_err()),
-            Error::BIP39(bip39::Mnemonic::from_str("not a valid mnemonic at all").unwrap_err()),
-            Error::BitcoinEncode(
+            pair(
+                serde_json::from_str::<serde_json::Value>("{oops").unwrap_err(),
+                Error::JSON,
+            ),
+            pair(url::Url::parse("not a url").unwrap_err(), Error::Url),
+            pair(
+                bitcoin::secp256k1::PublicKey::from_str("00").unwrap_err(),
+                Error::Secp,
+            ),
+            pair(bitcoin::PublicKey::from_str("zz").unwrap_err(), Error::Key),
+            pair(
+                bitcoin::hashes::sha256::Hash::from_slice(&[1, 2, 3]).unwrap_err(),
+                Error::Hash,
+            ),
+            pair(
+                bitcoin::bip32::Xpriv::from_str("xprvBAD").unwrap_err(),
+                Error::BIP32,
+            ),
+            pair(
+                bip39::Mnemonic::from_str("not a valid mnemonic at all").unwrap_err(),
+                Error::BIP39,
+            ),
+            pair(
                 bitcoin::consensus::deserialize::<bitcoin::Transaction>(&[1, 2]).unwrap_err(),
+                Error::BitcoinEncode,
             ),
-            Error::LiquidEncode(
+            pair(
                 elements::encode::deserialize::<elements::Transaction>(&[1, 2]).unwrap_err(),
+                Error::LiquidEncode,
             ),
-            Error::IO(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            pair(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+                Error::IO,
+            ),
         ]
     }
 
     /// The constraint that rules out thinning `Display` to fix the duplication:
     /// callers printing `{e}` must keep seeing the wrapped error's own message,
-    /// and `message()` — which both bindings map through — must agree with it.
+    /// with nothing added and nothing dropped.
+    ///
+    /// Both binding crates depend on this holding. `bindings-wasm` reaches it
+    /// two ways — `js_sys::Error::new(&e.message())` for core errors, and
+    /// `arg_err`/`internal_err`, which are generic over `Display` and call
+    /// `to_string()` — and `bindings` maps through `message()`. Neither can move
+    /// while this passes.
     #[test]
-    fn display_still_renders_the_wrapped_errors_own_message() {
-        let json = serde_json::from_str::<serde_json::Value>("{oops").unwrap_err();
-        let inner = json.to_string();
-        let error = Error::JSON(json);
-        assert_eq!(error.to_string(), inner);
-        assert_eq!(error.message(), inner);
-
-        for error in wrapped_variants() {
+    fn display_renders_the_wrapped_errors_own_message_and_nothing_else() {
+        for (error, wrapped) in wrapped_variants() {
             assert_eq!(
                 error.to_string(),
+                wrapped,
+                "{} renders something other than the error it wraps",
+                error.name()
+            );
+            assert_eq!(
                 error.message(),
-                "Display and message() diverged for {}",
+                wrapped,
+                "{} diverged from the error it wraps",
                 error.name()
             );
         }
@@ -491,10 +542,17 @@ mod tests {
 
     /// The regression this module exists for: `source()` used to hand back the
     /// same error whose text `Display` had just rendered, so a chain repeated
-    /// one message. Every one of these fails against that implementation.
+    /// one message. This fails for every variant against that implementation,
+    /// which returned `Some` unconditionally.
+    ///
+    /// Necessarily conditional, though, and so no guard against the opposite
+    /// mistake: most wrapped types have no cause of their own, and for those
+    /// this says nothing. An arm that wrongly answered `None` where a cause
+    /// exists is caught by `a_cause_below_the_wrapped_error_is_reached`, which
+    /// covers the two variants that go deeper.
     #[test]
     fn a_wrapped_error_is_not_repeated_as_its_own_cause() {
-        for error in wrapped_variants() {
+        for (error, _) in wrapped_variants() {
             if let Some(cause) = StdError::source(&error) {
                 assert_ne!(
                     error.to_string(),
@@ -508,42 +566,46 @@ mod tests {
 
     /// Forwarding is not merely "answer `None`": where the wrapped error has a
     /// cause of its own, the chain reaches it. Both of these hide a specific
-    /// cause behind a generic message, which is precisely what was lost.
+    /// cause behind a generic message, which is what the duplicate stood in
+    /// front of.
+    ///
+    /// The assertions deliberately do not pin exact depth or upstream wording.
+    /// Every string here belongs to `bitcoin`/`base58ck` under a caret
+    /// requirement, and a dependency bump that adds a layer or rewords one
+    /// should not read as a regression in `source` on a PR that changed no
+    /// code. What must hold is that the chain goes deeper than this enum and
+    /// arrives somewhere `Display` did not already say.
     #[test]
     fn a_cause_below_the_wrapped_error_is_reached() {
         let bip32 = Error::BIP32(bitcoin::bip32::Xpriv::from_str("xprvBAD").unwrap_err());
         let rendered = chain(&bip32);
-        // Three layers, all of them below this enum: the generic base58
-        // complaint, then the kind of base58 failure, then the mismatch itself.
-        // The old impl reported exactly one, repeated.
-        assert_eq!(
-            rendered.len(),
-            3,
-            "expected the full base58 chain, got {rendered:?}"
-        );
-        assert_eq!(rendered[0], "base58 encoding error");
-        assert_eq!(rendered[1], "incorrect checksum");
         assert!(
-            rendered[2].contains("does not match expected"),
-            "the mismatch detail was dropped: {rendered:?}"
+            rendered.len() >= 2,
+            "no cause below the base58 error: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().skip(1).any(|m| m.contains("checksum")),
+            "the chain never reaches the checksum failure: {rendered:?}"
         );
 
         let encode = Error::BitcoinEncode(
             bitcoin::consensus::deserialize::<bitcoin::Transaction>(&[1, 2]).unwrap_err(),
         );
         let rendered = chain(&encode);
-        assert_eq!(rendered.len(), 2, "expected a cause below {rendered:?}");
-        assert_eq!(rendered[0], "IO error");
         assert!(
-            rendered[1].contains("UnexpectedEof"),
-            "expected the truncation to survive, got {rendered:?}"
+            rendered.len() >= 2,
+            "no cause below the encode error: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().skip(1).any(|m| m.contains("Eof")),
+            "the chain never reaches the truncation: {rendered:?}"
         );
     }
 
     /// A rendered chain shows each layer once, for every wrapped variant.
     #[test]
     fn a_rendered_chain_prints_each_message_once() {
-        for error in wrapped_variants() {
+        for (error, _) in wrapped_variants() {
             let rendered = chain(&error);
             let mut seen = rendered.clone();
             seen.sort();
@@ -562,12 +624,11 @@ mod tests {
     /// at their conversion site. All of them keep their text in `Display`.
     #[test]
     fn flattened_and_unsupported_variants_report_no_cause() {
-        let bolt11 =
-            Error::Bolt11(lightning_invoice::Bolt11Invoice::from_str("nonsense").unwrap_err());
-        assert!(StdError::source(&bolt11).is_none());
-        assert!(!bolt11.to_string().is_empty(), "its text must survive");
-
         for error in [
+            // The two that wrap a concrete error whose type does not implement
+            // the trait, so there is nothing this impl could forward to.
+            Error::Bolt11(lightning_invoice::Bolt11Invoice::from_str("nonsense").unwrap_err()),
+            Error::BIP85(bip85_extended::Error::InvalidWordCount(7)),
             Error::Generic("flattened".to_string()),
             Error::HTTP("error sending request".to_string()),
             Error::Protocol("not a key".to_string()),
@@ -582,7 +643,13 @@ mod tests {
                 "{} reported a cause it has no access to",
                 error.name()
             );
-            assert_eq!(chain(&error).len(), 1);
+            // The text still has to survive in this error's own Display.
+            assert_eq!(chain(&error), vec![error.message()]);
+            assert!(
+                !error.message().is_empty(),
+                "{} lost its text",
+                error.name()
+            );
         }
     }
 
