@@ -11,11 +11,43 @@ It derived `Debug` and implemented `Display`, but not `std::error::Error` — so
 `anyhow::Result`, and it could not be a `source()` inside a caller's own error
 type. Every consumer needed a `map_err` at each call site to work around it.
 
-`source()` is threaded through for the variants that wrap a concrete error, so a
-caller printing a chain now reaches the underlying cause. The `String` variants
-report none — whatever produced them was flattened when it was converted — and
-neither do `Bolt11` and `BIP85`, whose upstream error types do not implement the
-trait themselves.
+`source()` forwards *past* the error a variant wraps, to that error's own cause,
+rather than handing the wrapped error back. This enum's `Display` is already
+that error's text — `JSON(serde_json::Error)` adds no context of its own — so
+returning it as the cause would make a reported chain print one message at two
+levels, once as the error and again as what caused it. Forwarding is the
+`#[error(transparent)]` semantic, and what `std::io::Error` itself does with a
+custom payload. A malformed extended key reports
+
+```
+base58 encoding error
+
+Caused by:
+    0: incorrect checksum
+    1: base58 checksum 0xf67f4ccf does not match expected 0x6639937d
+```
+
+Most wrapped types have no cause of their own, so `source()` answers `None` for
+them; `BIP32` and `BitcoinEncode` are the two that go deeper. `Bolt11` and
+`BIP85` report none because their upstream types do not implement the trait at
+all, and the `String` variants because whatever produced them was flattened when
+it was converted. All of them still carry their text in `Display`.
+
+No message text moves. `Display` and `message()` render exactly what they did
+before, which is what every binding surface depends on — `bindings` maps through
+`message()`, and `bindings-wasm` uses both it and `Display` (`arg_err` and
+`internal_err` are generic over `Display`). A test pins this per variant against
+the wrapped error's own text.
+
+Note for anyone holding this error behind `Box<dyn std::error::Error>`:
+`source()` yields the wrapped error's cause, not the wrapped error, so
+downcasting through the chain to e.g. `serde_json::Error` will not resolve. Match
+the variant instead — `Error::JSON(e)` — which is the idiomatic path here.
+
+`src/error.rs` gains the test module it had none of: six tests covering the
+absence of a repeated message, `Display` text held per variant, a forwarded
+cause actually reached, the deliberate `None`s, and `?` lifting into both
+`Box<dyn Error>` and `anyhow::Result`.
 
 ### Added — `examples/kaleido_attribution_probe.rs`
 
