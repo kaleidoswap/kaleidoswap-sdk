@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — a reported error chain no longer prints one message twice
+
+`Display` is `Error::message()`, which for a wrapped variant is that error's own
+text, and `source()` handed the same error back as the cause — so every reporter
+that walks the chain printed one message at two levels:
+
+```
+key must be a string at line 1 column 2
+
+Caused by:
+    key must be a string at line 1 column 2
+```
+
+`source()` now forwards *past* the wrapped error to its own cause, which is the
+`#[error(transparent)]` semantic and what `std::io::Error` does with a custom
+payload. No message text changes: `Display` and `message()` are byte-identical
+to before, so nothing a caller prints — or either binding, which both map
+through `message()` — moves. What changes is that a chain reaches causes the
+duplicate was standing in front of. A bad extended key now reports
+
+```
+base58 encoding error
+
+Caused by:
+    0: incorrect checksum
+    1: base58 checksum 0xf67f4ccf does not match expected 0x6639937d
+```
+
+where before it reported `base58 encoding error` twice and stopped.
+
+One consequence worth naming: `source()` no longer yields the wrapped error
+itself, so `err.source().and_then(|s| s.downcast_ref::<serde_json::Error>())`
+stops resolving. Match the variant instead — `Error::JSON(e)` — which is the
+idiomatic path here and is unaffected.
+
+The `None` arms are enumerated instead of left to a `_` wildcard, so a new
+variant that wraps a concrete error now has to make a choice in `source()` the
+way it already must in `name()` and `message()`, rather than silently losing its
+cause. `src/error.rs` gains the test module it had none of; three of its six
+tests fail against the previous implementation.
+
 ### Fixed — `Error` implements `std::error::Error`
 
 It derived `Debug` and implemented `Display`, but not `std::error::Error` — so

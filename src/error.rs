@@ -368,35 +368,237 @@ impl Display for Error {
 /// `anyhow::Result` — the two things almost every consumer's `main` and every
 /// wrapping error type are built on. `Display` alone is not enough for that.
 ///
-/// `source` is threaded through for the variants that wrap a concrete error, so
-/// a caller reporting a chain sees the underlying cause rather than only this
-/// enum's own message. Three groups give nothing back: the `String` variants,
-/// because whatever produced them was flattened at the conversion site, and
-/// `Bolt11` / `BIP85`, whose upstream error types do not implement
-/// `std::error::Error` themselves. Their text is still in this error's own
-/// `Display`.
+/// `source` forwards *past* the wrapped error instead of returning it. This
+/// enum's `Display` is [`Error::message`], which for a wrapped variant is that
+/// error's own text — `JSON(serde_json::Error)` adds no context of its own — so
+/// handing the same error back as the cause makes a reported chain print one
+/// message twice, once as the error and again as what caused it. Forwarding is
+/// the `#[error(transparent)]` semantic, and what [`std::io::Error`] itself does
+/// with a custom payload: what a reader has not already seen is the wrapped
+/// error's *own* cause. For `bitcoin::bip32::Error` that turns "base58 encoding
+/// error" printed twice into "base58 encoding error" caused by "incorrect
+/// checksum".
+///
+/// The arms answering `None` are enumerated rather than left to a wildcard, so a
+/// new variant wrapping a concrete error has to make a choice here — the way it
+/// already must in [`Error::name`] and [`Error::message`] — instead of silently
+/// losing its cause. `Bolt11` and `BIP85` report none because their upstream
+/// types do not implement `std::error::Error` at all, and the `String` variants
+/// because whatever produced them was flattened at the conversion site. Every
+/// one of them still carries its text in this error's own `Display`.
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             #[cfg(feature = "electrum")]
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            Error::Electrum(e) => Some(e),
-            Error::Key(e) => Some(e),
-            Error::Sighash(e) => Some(e),
-            Error::ElSighash(e) => Some(e),
-            Error::Secp(e) => Some(e),
-            Error::JSON(e) => Some(e),
-            Error::IO(e) => Some(e),
-            Error::LiquidEncode(e) => Some(e),
-            Error::BitcoinEncode(e) => Some(e),
-            Error::ConfidentialTx(e) => Some(e),
-            Error::BIP32(e) => Some(e),
-            Error::BIP39(e) => Some(e),
-            Error::Hash(e) => Some(e),
-            Error::Url(e) => Some(e),
+            Error::Electrum(e) => e.source(),
+            Error::Key(e) => e.source(),
+            Error::Sighash(e) => e.source(),
+            Error::ElSighash(e) => e.source(),
+            Error::Secp(e) => e.source(),
+            Error::JSON(e) => e.source(),
+            Error::IO(e) => e.source(),
+            Error::LiquidEncode(e) => e.source(),
+            Error::BitcoinEncode(e) => e.source(),
+            Error::ConfidentialTx(e) => e.source(),
+            Error::BIP32(e) => e.source(),
+            Error::BIP39(e) => e.source(),
+            Error::Hash(e) => e.source(),
+            Error::Url(e) => e.source(),
             #[cfg(feature = "ws")]
-            Error::WebSocket(e) => Some(e.as_ref()),
-            _ => None,
+            Error::WebSocket(e) => e.as_ref().source(),
+
+            // Nothing below these to report.
+            #[cfg(feature = "esplora")]
+            Error::Esplora(_) => None,
+            Error::Hex(_)
+            | Error::Protocol(_)
+            | Error::Address(_)
+            | Error::HTTP(_)
+            | Error::Bolt11(_)
+            | Error::Blind(_)
+            | Error::BIP85(_)
+            | Error::Locktime(_)
+            | Error::Taproot(_)
+            | Error::Musig2(_)
+            | Error::LiquidFeeAssetRequired
+            | Error::Generic(_)
+            | Error::HTTPStatusNotSuccess(_, _)
+            | Error::HTTPResponseBodyInvalid(_, _) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as StdError;
+    use std::str::FromStr;
+
+    /// Every message a reporter would print, outermost first.
+    fn chain(error: &Error) -> Vec<String> {
+        let mut rendered = vec![error.to_string()];
+        let mut cause = StdError::source(error);
+        while let Some(next) = cause {
+            rendered.push(next.to_string());
+            cause = next.source();
+        }
+        rendered
+    }
+
+    /// One of each variant that wraps a concrete error, built from a real
+    /// failure rather than a constructed one.
+    fn wrapped_variants() -> Vec<Error> {
+        use bitcoin::hashes::Hash as _;
+        vec![
+            Error::JSON(serde_json::from_str::<serde_json::Value>("{oops").unwrap_err()),
+            Error::Url(url::Url::parse("not a url").unwrap_err()),
+            Error::Secp(bitcoin::secp256k1::PublicKey::from_str("00").unwrap_err()),
+            Error::Key(bitcoin::PublicKey::from_str("zz").unwrap_err()),
+            Error::Hash(bitcoin::hashes::sha256::Hash::from_slice(&[1, 2, 3]).unwrap_err()),
+            Error::BIP32(bitcoin::bip32::Xpriv::from_str("xprvBAD").unwrap_err()),
+            Error::BIP39(bip39::Mnemonic::from_str("not a valid mnemonic at all").unwrap_err()),
+            Error::BitcoinEncode(
+                bitcoin::consensus::deserialize::<bitcoin::Transaction>(&[1, 2]).unwrap_err(),
+            ),
+            Error::LiquidEncode(
+                elements::encode::deserialize::<elements::Transaction>(&[1, 2]).unwrap_err(),
+            ),
+            Error::IO(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ]
+    }
+
+    /// The constraint that rules out thinning `Display` to fix the duplication:
+    /// callers printing `{e}` must keep seeing the wrapped error's own message,
+    /// and `message()` — which both bindings map through — must agree with it.
+    #[test]
+    fn display_still_renders_the_wrapped_errors_own_message() {
+        let json = serde_json::from_str::<serde_json::Value>("{oops").unwrap_err();
+        let inner = json.to_string();
+        let error = Error::JSON(json);
+        assert_eq!(error.to_string(), inner);
+        assert_eq!(error.message(), inner);
+
+        for error in wrapped_variants() {
+            assert_eq!(
+                error.to_string(),
+                error.message(),
+                "Display and message() diverged for {}",
+                error.name()
+            );
+        }
+    }
+
+    /// The regression this module exists for: `source()` used to hand back the
+    /// same error whose text `Display` had just rendered, so a chain repeated
+    /// one message. Every one of these fails against that implementation.
+    #[test]
+    fn a_wrapped_error_is_not_repeated_as_its_own_cause() {
+        for error in wrapped_variants() {
+            if let Some(cause) = StdError::source(&error) {
+                assert_ne!(
+                    error.to_string(),
+                    cause.to_string(),
+                    "{} reports its own message as its cause",
+                    error.name()
+                );
+            }
+        }
+    }
+
+    /// Forwarding is not merely "answer `None`": where the wrapped error has a
+    /// cause of its own, the chain reaches it. Both of these hide a specific
+    /// cause behind a generic message, which is precisely what was lost.
+    #[test]
+    fn a_cause_below_the_wrapped_error_is_reached() {
+        let bip32 = Error::BIP32(bitcoin::bip32::Xpriv::from_str("xprvBAD").unwrap_err());
+        let rendered = chain(&bip32);
+        // Three layers, all of them below this enum: the generic base58
+        // complaint, then the kind of base58 failure, then the mismatch itself.
+        // The old impl reported exactly one, repeated.
+        assert_eq!(
+            rendered.len(),
+            3,
+            "expected the full base58 chain, got {rendered:?}"
+        );
+        assert_eq!(rendered[0], "base58 encoding error");
+        assert_eq!(rendered[1], "incorrect checksum");
+        assert!(
+            rendered[2].contains("does not match expected"),
+            "the mismatch detail was dropped: {rendered:?}"
+        );
+
+        let encode = Error::BitcoinEncode(
+            bitcoin::consensus::deserialize::<bitcoin::Transaction>(&[1, 2]).unwrap_err(),
+        );
+        let rendered = chain(&encode);
+        assert_eq!(rendered.len(), 2, "expected a cause below {rendered:?}");
+        assert_eq!(rendered[0], "IO error");
+        assert!(
+            rendered[1].contains("UnexpectedEof"),
+            "expected the truncation to survive, got {rendered:?}"
+        );
+    }
+
+    /// A rendered chain shows each layer once, for every wrapped variant.
+    #[test]
+    fn a_rendered_chain_prints_each_message_once() {
+        for error in wrapped_variants() {
+            let rendered = chain(&error);
+            let mut seen = rendered.clone();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                rendered.len(),
+                "{} renders a repeated message: {rendered:?}",
+                error.name()
+            );
+        }
+    }
+
+    /// The deliberate `None`s. `Bolt11` and `BIP85` wrap a concrete error whose
+    /// type does not implement the trait; the rest were flattened to a `String`
+    /// at their conversion site. All of them keep their text in `Display`.
+    #[test]
+    fn flattened_and_unsupported_variants_report_no_cause() {
+        let bolt11 =
+            Error::Bolt11(lightning_invoice::Bolt11Invoice::from_str("nonsense").unwrap_err());
+        assert!(StdError::source(&bolt11).is_none());
+        assert!(!bolt11.to_string().is_empty(), "its text must survive");
+
+        for error in [
+            Error::Generic("flattened".to_string()),
+            Error::HTTP("error sending request".to_string()),
+            Error::Protocol("not a key".to_string()),
+            Error::LiquidFeeAssetRequired,
+            Error::HTTPStatusNotSuccess(
+                reqwest::StatusCode::UNAUTHORIZED,
+                serde_json::json!({"error": "unauthorized"}),
+            ),
+        ] {
+            assert!(
+                StdError::source(&error).is_none(),
+                "{} reported a cause it has no access to",
+                error.name()
+            );
+            assert_eq!(chain(&error).len(), 1);
+        }
+    }
+
+    /// The reason the impl exists at all: `?` lifting into the two result types
+    /// almost every consumer's `main` is built on.
+    #[test]
+    fn the_error_lifts_through_question_mark() {
+        fn boxed() -> Result<(), Box<dyn StdError>> {
+            Err(Error::Generic("lifted".to_string()))?;
+            Ok(())
+        }
+        fn with_anyhow() -> anyhow::Result<()> {
+            Err(Error::Generic("lifted".to_string()))?;
+            Ok(())
+        }
+        assert_eq!(boxed().unwrap_err().to_string(), "lifted");
+        assert_eq!(with_anyhow().unwrap_err().to_string(), "lifted");
     }
 }
