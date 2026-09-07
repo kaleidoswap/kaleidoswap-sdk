@@ -756,6 +756,10 @@ mod tests {
             panic!("From<reqwest::Error> must produce Error::HTTP");
         };
         assert!(error.is_builder(), "the builder failure was reclassified");
+        // `is_connect` is `#[cfg(not(target_arch = "wasm32"))]` in reqwest, so
+        // only this assertion is gated — `is_builder`, and the point of the
+        // test, hold on every target.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         assert!(
             !error.is_connect(),
             "a builder failure is not a connect one"
