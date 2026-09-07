@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — `Error` implements `std::error::Error`
+
+It derived `Debug` and implemented `Display`, but not `std::error::Error` — so
+`?` could not lift a library error into `Box<dyn std::error::Error>` or
+`anyhow::Result`, and it could not be a `source()` inside a caller's own error
+type. Every consumer needed a `map_err` at each call site to work around it.
+
+`source()` is threaded through for the variants that wrap a concrete error, so a
+caller printing a chain now reaches the underlying cause. The `String` variants
+report none — whatever produced them was flattened when it was converted — and
+neither do `Bolt11` and `BIP85`, whose upstream error types do not implement the
+trait themselves.
+
+### Added — `examples/kaleido_attribution_probe.rs`
+
+A runnable check of the attribution path against a local maker: it parses a key
+and asserts the secret is absent from both `Debug` and `redacted()`, confirms a
+plaintext non-loopback maker URL is refused at construction, creates an
+attributed swap through `KaleidoMakerClient` and an anonymous one through the
+plain `BoltzApiClientV2`, and confirms a tampered key is answered `401` rather
+than silently downgraded. Every check is an assertion, and only the maker's own
+`401` counts as a refusal: a connection failure or any other status fails the
+probe rather than reading as a pass.
+
+```bash
+MAKER_URL=http://127.0.0.1:9420/v2 KALEIDOSWAP_API_KEY=kld_test_… \
+  cargo run --example kaleido_attribution_probe
+```
+
 ## [0.4.0] - 2026-09-03
 
 ### Added — partner attribution through an organization API key
