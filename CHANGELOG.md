@@ -49,6 +49,113 @@ absence of a repeated message, `Display` text held per variant, a forwarded
 cause actually reached, the deliberate `None`s, and `?` lifting into both
 `Box<dyn Error>` and `anyhow::Result`.
 
+### Breaking — a failed request keeps the reason it failed
+
+`Error::HTTP` held a `String`, produced by `From<reqwest::Error>` as
+`value.to_string()`. reqwest 0.12's `Display` renders only its own layer —
+"error sending request for url (…)" — and never its source, so the actionable
+half of every network failure was destroyed at the conversion site and could not
+be recovered afterwards. A refused maker, a DNS failure and a rejected
+certificate all arrived as the same sentence.
+
+It now holds the error: `HTTP(reqwest::Error)`, with `source()` forwarding
+to that error's own cause. A refused connection reports
+
+```
+error sending request for url (https://api.example.com/v2/swap)
+
+Caused by:
+    0: client error (Connect)
+    1: tcp connect error
+    2: Connection refused (os error 61)
+```
+
+and a name that does not resolve reaches `dns error` and the resolver's own
+message. `HTTP` joins `BIP32` and `BitcoinEncode` as the variants whose chain
+goes deeper than this enum, and it is the one where that pays off
+operationally.
+
+**No message text moves on this crate's own requests.** For an error from
+`From<reqwest::Error>`, `Display` and `message()` still render exactly
+reqwest's own layer, byte-identical to before, which is what the binding
+surfaces read. The detail is *added* below, not folded into the message.
+
+It does move on the `util::lnurl` path, and there it initially moved the wrong
+way. `lnurl::Error`'s `Display` is `write!(f, "{:?}", self)`, and reqwest's
+`Debug` recurses into `source`, so the old `Error::HTTP(e.to_string())`
+happened to carry the whole chain inside one string — while the new
+`message()` renders only reqwest's own layer. So on that path `message()` alone
+now says *less* than before. Every in-repo reader of it was moved to
+`message_with_causes()`, which says the same or more; a downstream caller
+reading `message()` on an lnurl transport failure should do the same. There is
+a test pinning both halves: that the old flattened string carried the refusal,
+and that the fold still does.
+
+`Error::message_with_causes()` is new, for a surface that can carry only a
+string and so cannot walk `source()` itself — a UniFFI enum, a `js_sys::Error`,
+a log line. It is `message()` followed by every cause, `: ` apart, and returns
+exactly `message()` for a variant with no cause. A Rust caller reporting a
+chain (`anyhow`, `eyre`, Sentry) wants `message()` and gets the layers
+separately.
+
+Migration, for a Rust caller that destructures the variant:
+
+```rust
+// Interpolating the payload compiles unchanged and renders the same text.
+Err(Error::HTTP(detail)) => log::warn!("request failed: {detail}"),
+// Code that wanted the `String` itself now has to render it.
+Err(Error::HTTP(detail)) => remember(detail.to_string()),
+// And this is what the change is for.
+Err(error @ Error::HTTP(_)) => log::warn!("request failed: {}", error.message_with_causes()),
+```
+
+Anything that stored or matched on the `String` itself needs `.to_string()` (or
+`message_with_causes()`), so the next release is a minor bump rather than a
+patch.
+
+One consequence with no migration, because there is no substitute:
+`Error::HTTP` can no longer be *constructed* outside this crate. reqwest's
+error constructors are `pub(crate)`, and `#[non_exhaustive]` sits on the enum
+rather than the variant, so downstream code that built one for its own tests or
+mocks — `Error::HTTP("simulated timeout".to_string())` — has no replacement
+expression. Such a test needs a real failed request (a refused loopback port
+works, as this crate's own tests do it) or a different variant, such as
+`Error::Generic`. In exchange the caller reaches reqwest's own classification, which no
+string could answer: `is_timeout()`, `is_connect()`, `is_decode()`, `status()`,
+`url()`. `reqwest` is already re-exported from this crate's root, so the variant
+exposes nothing that was not already public.
+
+On the bindings, Python, Kotlin and Swift now receive the causes: `bindings`
+maps `HTTP` through `message_with_causes()`, so `Error.Http` reads "error
+sending request for url (…): client error (Connect): …" instead of stopping at
+the first clause. The WebAssembly surface is unchanged — `core_err` renders
+`message()` for every variant, and moving that would move every *other*
+variant's message too; a JS caller that wants the causes can be given
+`message_with_causes()` deliberately.
+
+The other `String` variants (`Hex`, `Address`, `Blind`, `Locktime`, `Taproot`,
+`Musig2`) stay flattened, and not by oversight: each is a category fed by
+several unrelated upstream types — `Hex` and `Taproot` by four each — so there
+is no single concrete error a variant could hold. Giving them a chain means a
+`Box<dyn Error>` payload, trading the typed access `HTTP` gains for a cause
+chain. `HTTP` never had to make that trade, being fed by exactly one type, which
+is why it is the one that changed.
+
+Also on this path: `util::lnurl` built `Error::HTTP` from `lnurl::Error`, which
+covers that whole client and not just its socket. Only its `Reqwest` variant is
+a transport failure and is what now becomes `Error::HTTP`; `InvalidLnUrl`,
+`HttpResponse(404)` and `Json` are answers rather than failures to reach anyone,
+and report as `Error::Generic` with the text they always rendered.
+
+`src/error.rs` gains four tests, and `HTTP` joins the wrapped-variant table
+that four existing ones iterate: the cause below a failed request is reached,
+reqwest's classification survives the wrap, a refused connection on loopback
+reports why it failed, and `message_with_causes` folds the chain while
+`message` does not. Each was checked by mutation — reverting `source()` to
+`None`, restoring the duplicate, giving `message()` its own wording, and
+emptying the fold each fail the intended tests. As elsewhere in that module the
+assertions avoid pinning upstream wording or chain depth.
+
 ### Added — `examples/kaleido_attribution_probe.rs`
 
 A runnable check of the attribution path against a local maker: it parses a key

@@ -4034,16 +4034,39 @@ mod tests {
     fn live<T>(result: Result<T, Error>, base_url: &str, what: &str) -> Option<T> {
         match result {
             Ok(value) => Some(value),
-            // `Error::HTTP` is this crate's `From<reqwest::Error>`, and nothing
-            // on this client's path produces it any other way: a rejected
-            // status becomes `HTTPStatusNotSuccess`, and a body that will not
-            // deserialize becomes `HTTPResponseBodyInvalid` or `JSON`. So this
-            // variant means the request never came back — refused, DNS, TLS, or
-            // the timeout above — and the SDK is not what is under test.
-            Err(Error::HTTP(detail)) => {
+            // `Error::HTTP` is this crate's `From<reqwest::Error>`. A rejected
+            // status becomes `HTTPStatusNotSuccess` and a body that will not
+            // deserialize becomes `HTTPResponseBodyInvalid` or `JSON`, so this
+            // variant is a transport failure: refused, DNS, TLS, the timeout
+            // above — or, as the doc on the variant now says explicitly, a body
+            // this client could not read, such as a mid-body reset. The older
+            // comment here claimed the variant could only mean the request
+            // never came back, which `response.text()` makes untrue.
+            //
+            // All of those skip rather than fail. A third party resetting
+            // mid-response is that party having a bad minute, not the schema or
+            // protocol regression these tests exist to detect, and failing on
+            // it is the "outage blocks every merge" case above. The
+            // classification is named in the skip line instead, so an
+            // unexpected shape shows up in the log rather than being flattened
+            // into every other reason a host was unreachable.
+            Err(error @ Error::HTTP(_)) => {
                 // Announced, not silent: a run where every live test skipped
-                // must not read like one where they all passed.
-                eprintln!("SKIPPED {what}: {base_url} did not answer ({detail})");
+                // must not read like one where they all passed. With the
+                // causes, because reqwest's own layer only says a request was
+                // sent, and which of refused / DNS / TLS / timed out it was is
+                // the whole content of a skip line.
+                //
+                // Holding the error rather than its text is what makes the
+                // classification available with no second request.
+                let kind = match &error {
+                    Error::HTTP(e) if e.is_connect() => "connect",
+                    Error::HTTP(e) if e.is_timeout() => "timeout",
+                    Error::HTTP(e) if e.is_body() || e.is_decode() => "body",
+                    _ => "other",
+                };
+                let detail = error.message_with_causes();
+                eprintln!("SKIPPED {what}: {base_url} did not answer [{kind}] ({detail})");
                 None
             }
             Err(error) => panic!("{what} failed against a responding {base_url}: {error:?}"),
