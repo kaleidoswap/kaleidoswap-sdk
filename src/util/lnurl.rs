@@ -12,15 +12,33 @@ use std::str::FromStr;
 /// `HttpResponse(404)` and `Json` are answers, not failures to reach anyone,
 /// and `Error::HTTP` now means specifically "no usable response came back".
 /// Only `Reqwest` is that, and it carries the same `reqwest::Error` this
-/// crate's own requests produce — lnurl-rs and this crate resolve to one
-/// `reqwest`.
+/// crate's own requests produce — `Cargo.lock` has a single `reqwest`, so
+/// lnurl-rs and this crate resolve to one.
 ///
 /// The others fold to text as before. Note that `lnurl::Error` renders through
-/// `Debug`, so `HttpResponse(404)` reads as `HttpResponse(404)`.
+/// `Debug` (its `Display` is `write!(f, "{:?}", self)`), so `HttpResponse(404)`
+/// reads as `HttpResponse(404)`.
+///
+/// Enumerated rather than closed with a catch-all: a future lnurl-rs release
+/// that adds a transport-shaped variant should fail to compile here instead of
+/// landing silently in [`Error::Generic`]. `Ureq` is absent because this crate
+/// takes lnurl-rs without its `blocking` feature.
+///
+/// `Io` and `Json` could each be carried by the matching variant of this enum
+/// instead, which would keep their causes too; that is a separate change from
+/// the one this function exists for, and is left deliberately.
 fn from_lnurl_error(e: lnurl::Error) -> Error {
     match e {
-        lnurl::Error::Reqwest(e) => Error::HTTP(Box::new(e)),
-        other => Error::Generic(other.to_string()),
+        lnurl::Error::Reqwest(e) => Error::HTTP(e),
+        e @ (lnurl::Error::InvalidLnUrl
+        | lnurl::Error::InvalidLightningAddress
+        | lnurl::Error::InvalidComment
+        | lnurl::Error::InvalidAmount
+        | lnurl::Error::HttpResponse(_)
+        | lnurl::Error::Io(_)
+        | lnurl::Error::Json(_)
+        | lnurl::Error::InvalidResponse
+        | lnurl::Error::Other(_)) => Error::Generic(e.to_string()),
     }
 }
 
@@ -103,6 +121,82 @@ pub async fn process_withdrawal(withdraw: &WithdrawalResponse, invoice: &str) ->
 mod tests {
     use super::*;
 
+    /// The reclassification, and the cause it exists to keep.
+    ///
+    /// `lnurl::Error`'s `Display` is `{:?}`, and reqwest's `Debug` recurses
+    /// into `source`, so the old `Error::HTTP(e.to_string())` happened to
+    /// carry the whole chain inside one string. Holding the error is only an
+    /// improvement if the chain is still reachable — through `source()` for a
+    /// Rust caller, and through `message_with_causes` for a string-only one.
+    /// `message` alone renders strictly less than the old string did, which is
+    /// why the consumer above moved.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[macros::async_test]
+    async fn a_transport_failure_stays_http_and_keeps_its_cause() {
+        // Same shape as the refused-connection test in `crate::error`:
+        // loopback, no proxy so an answering one cannot turn this into a
+        // response, and bounded so a dropped connection cannot hang.
+        let refused = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("a client with no proxy builds")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on loopback port 1");
+        let old_flattened = lnurl::Error::Reqwest(refused).to_string();
+
+        let refused = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("a client with no proxy builds")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on loopback port 1");
+        let error = from_lnurl_error(lnurl::Error::Reqwest(refused));
+
+        assert_eq!(error.name(), "HTTP", "a transport failure lost its variant");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "no cause below reqwest's own layer"
+        );
+        // The old string carried the refusal; the fold still has to.
+        assert!(
+            old_flattened.to_lowercase().contains("refused"),
+            "the premise no longer holds: {old_flattened}"
+        );
+        assert!(
+            error
+                .message_with_causes()
+                .to_lowercase()
+                .contains("refused"),
+            "the refusal is gone from the folded text: {}",
+            error.message_with_causes()
+        );
+    }
+
+    /// An answer, not a failure to reach anyone, so not `Error::HTTP`.
+    #[test]
+    fn an_answer_is_not_a_transport_failure() {
+        for (case, expected_text) in [
+            (lnurl::Error::HttpResponse(404), "HttpResponse(404)"),
+            (lnurl::Error::InvalidLnUrl, "InvalidLnUrl"),
+            (lnurl::Error::InvalidResponse, "InvalidResponse"),
+        ] {
+            let error = from_lnurl_error(case);
+            assert_eq!(error.name(), "Generic", "wrong variant for {expected_text}");
+            assert_eq!(
+                error.message(),
+                expected_text,
+                "the text lnurl always rendered must survive"
+            );
+            assert!(std::error::Error::source(&error).is_none());
+        }
+    }
+
     async fn test_address(address: &str, amount_msats: u64, format: &str) {
         let result = fetch_invoice(address, amount_msats).await;
 
@@ -116,7 +210,11 @@ mod tests {
                 println!("Successfully fetched invoice, format : {format}")
             }
             Err(e) => {
-                println!("Error occured with {} format: {}", format, e.message());
+                println!(
+                    "Error occured with {} format: {}",
+                    format,
+                    e.message_with_causes()
+                );
             }
         }
     }

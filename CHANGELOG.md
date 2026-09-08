@@ -58,7 +58,7 @@ half of every network failure was destroyed at the conversion site and could not
 be recovered afterwards. A refused maker, a DNS failure and a rejected
 certificate all arrived as the same sentence.
 
-It now holds the error: `HTTP(Box<reqwest::Error>)`, with `source()` forwarding
+It now holds the error: `HTTP(reqwest::Error)`, with `source()` forwarding
 to that error's own cause. A refused connection reports
 
 ```
@@ -75,9 +75,21 @@ message. `HTTP` joins `BIP32` and `BitcoinEncode` as the variants whose chain
 goes deeper than this enum, and it is the one where that pays off
 operationally.
 
-**No message text moves.** `Display` and `message()` still render exactly
+**No message text moves on this crate's own requests.** For an error from
+`From<reqwest::Error>`, `Display` and `message()` still render exactly
 reqwest's own layer, byte-identical to before, which is what the binding
 surfaces read. The detail is *added* below, not folded into the message.
+
+It does move on the `util::lnurl` path, and there it initially moved the wrong
+way. `lnurl::Error`'s `Display` is `write!(f, "{:?}", self)`, and reqwest's
+`Debug` recurses into `source`, so the old `Error::HTTP(e.to_string())`
+happened to carry the whole chain inside one string — while the new
+`message()` renders only reqwest's own layer. So on that path `message()` alone
+now says *less* than before. Every in-repo reader of it was moved to
+`message_with_causes()`, which says the same or more; a downstream caller
+reading `message()` on an lnurl transport failure should do the same. There is
+a test pinning both halves: that the old flattened string carried the refusal,
+and that the fold still does.
 
 `Error::message_with_causes()` is new, for a surface that can carry only a
 string and so cannot walk `source()` itself — a UniFFI enum, a `js_sys::Error`,
@@ -99,7 +111,16 @@ Err(error @ Error::HTTP(_)) => log::warn!("request failed: {}", error.message_wi
 
 Anything that stored or matched on the `String` itself needs `.to_string()` (or
 `message_with_causes()`), so the next release is a minor bump rather than a
-patch. In exchange the caller reaches reqwest's own classification, which no
+patch.
+
+One consequence with no migration, because there is no substitute:
+`Error::HTTP` can no longer be *constructed* outside this crate. reqwest's
+error constructors are `pub(crate)`, and `#[non_exhaustive]` sits on the enum
+rather than the variant, so downstream code that built one for its own tests or
+mocks — `Error::HTTP("simulated timeout".to_string())` — has no replacement
+expression. Such a test needs a real failed request (a refused loopback port
+works, as this crate's own tests do it) or a different variant, such as
+`Error::Generic`. In exchange the caller reaches reqwest's own classification, which no
 string could answer: `is_timeout()`, `is_connect()`, `is_decode()`, `status()`,
 `url()`. `reqwest` is already re-exported from this crate's root, so the variant
 exposes nothing that was not already public.

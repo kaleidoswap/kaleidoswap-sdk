@@ -31,8 +31,10 @@ pub enum Error {
     /// [`Error::message_with_causes`] folds it into one string for a surface
     /// that can carry only text.
     ///
-    /// Boxed to keep this enum small, as [`Error::WebSocket`] is.
-    HTTP(Box<reqwest::Error>),
+    /// Held directly rather than boxed, unlike [`Error::WebSocket`]:
+    /// `reqwest::Error` is itself one pointer (`{ inner: Box<Inner> }`), so a
+    /// second box would add an allocation per conversion and save nothing.
+    HTTP(reqwest::Error),
     JSON(serde_json::Error),
     IO(std::io::Error),
     Bolt11(lightning_invoice::ParseOrSemanticError),
@@ -131,7 +133,7 @@ impl From<bitcoin::secp256k1::Error> for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(value: reqwest::Error) -> Self {
-        Self::HTTP(Box::new(value))
+        Self::HTTP(value)
     }
 }
 
@@ -457,7 +459,7 @@ impl std::error::Error for Error {
             Error::Sighash(e) => e.source(),
             Error::ElSighash(e) => e.source(),
             Error::Secp(e) => e.source(),
-            Error::HTTP(e) => e.as_ref().source(),
+            Error::HTTP(e) => e.source(),
             Error::JSON(e) => e.source(),
             Error::IO(e) => e.source(),
             Error::LiquidEncode(e) => e.source(),
@@ -545,7 +547,7 @@ mod tests {
                 Error::JSON,
             ),
             pair(url::Url::parse("not a url").unwrap_err(), Error::Url),
-            pair(unsent_request_error(), |e| Error::HTTP(Box::new(e))),
+            pair(unsent_request_error(), Error::HTTP),
             pair(
                 bitcoin::secp256k1::PublicKey::from_str("00").unwrap_err(),
                 Error::Secp,
@@ -729,7 +731,7 @@ mod tests {
     /// to reword.
     #[test]
     fn a_failed_request_reaches_the_cause_reqwest_does_not_render() {
-        let error = Error::HTTP(Box::new(unsent_request_error()));
+        let error = Error::HTTP(unsent_request_error());
         let rendered = chain(&error);
 
         assert!(
@@ -758,8 +760,10 @@ mod tests {
         assert!(error.is_builder(), "the builder failure was reclassified");
         // `is_connect` is `#[cfg(not(target_arch = "wasm32"))]` in reqwest, so
         // only this assertion is gated — `is_builder`, and the point of the
-        // test, hold on every target.
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        // test, hold on every target. The predicate matches reqwest's exactly
+        // rather than this module's usual `wasm32-unknown` pair, so it also
+        // holds for `wasm32-wasip1`, where the method is equally absent.
+        #[cfg(not(target_arch = "wasm32"))]
         assert!(
             !error.is_connect(),
             "a builder failure is not a connect one"
@@ -776,10 +780,23 @@ mod tests {
     /// Native-only, like every other test here that opens a socket: the wasm
     /// harness runs in a browser, where a fetch to a dead loopback port fails
     /// through the JS layer rather than as a connect error.
+    ///
+    /// `no_proxy` is load-bearing. `Client::new()` picks up `http_proxy` from
+    /// the environment and has no loopback bypass, so on a runner or in a
+    /// sandbox where that points at a proxy which *answers*, the send succeeds
+    /// and this test fails on a `502` instead of the refusal it is about. A
+    /// proxy that is itself dead would still pass, which is what makes the
+    /// failure easy to miss. The timeout covers the other shape: a proxy or
+    /// firewall that drops the connection rather than refusing it would
+    /// otherwise hang to the harness limit.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[macros::async_test]
     async fn a_refused_connection_reports_why_it_failed() {
-        let refused = reqwest::Client::new()
+        let refused = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("a client with no proxy builds")
             .get("http://127.0.0.1:1/")
             .send()
             .await
