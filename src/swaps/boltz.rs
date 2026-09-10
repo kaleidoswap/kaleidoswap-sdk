@@ -291,47 +291,60 @@ pub struct SubmarinePair {
     pub fee_asset_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `from` currency → `to` currency → pair, exactly as the server sends it.
+///
+/// A map rather than one field per currency. With named fields, serde drops
+/// any currency the struct has no field for — silently, since there is no
+/// error to raise for an unknown key — so a route the server publishes never
+/// reaches the caller and the map simply comes back shorter. `ARKD` submarine
+/// pairs disappeared that way. A map also means a new venue is a server-side
+/// change alone, where a field per currency made it an SDK release.
+///
+/// A currency the server does not serve is absent, which is what an empty
+/// lookup already meant; `{}` deserializes to an empty map, so the tolerance
+/// the old `default` attributes provided is inherent here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct GetSubmarinePairsResponse {
-    // `default`: a maker need not serve every asset (e.g. the KaleidoSwap
-    // maker advertises no L-BTC submarine pairs) — a missing key is an empty
-    // map, not a deserialization failure.
-    #[serde(rename = "BTC", default)]
-    pub btc: HashMap<String, SubmarinePair>,
-    #[serde(rename = "L-BTC", default)]
-    pub lbtc: HashMap<String, SubmarinePair>,
-    #[serde(rename = "L-USDT", default)]
-    pub lusdt: HashMap<String, SubmarinePair>,
+    pub pairs: HashMap<String, HashMap<String, SubmarinePair>>,
 }
 
 impl GetSubmarinePairsResponse {
+    /// The pair for one `from`/`to` currency pair, if the server serves it.
+    ///
+    /// The general lookup the named accessors below are shorthand for. Use it
+    /// for currencies that have no named accessor.
+    pub fn get(&self, from: &str, to: &str) -> Option<&SubmarinePair> {
+        self.pairs.get(from)?.get(to)
+    }
+
     /// Get the BtcBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_btc_to_btc_pair(&self) -> Option<SubmarinePair> {
-        self.btc.get("BTC").cloned()
+        self.get("BTC", "BTC").cloned()
     }
 
     /// Get the BtcLBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_btc_to_lbtc_pair(&self) -> Option<SubmarinePair> {
-        self.btc.get("L-BTC").cloned()
+        self.get("BTC", "L-BTC").cloned()
     }
 
     /// Get the LBtcBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_lbtc_to_btc_pair(&self) -> Option<SubmarinePair> {
-        self.lbtc.get("BTC").cloned()
+        self.get("L-BTC", "BTC").cloned()
     }
 
     /// Get the LBtcLBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_lbtc_to_lbtc_pair(&self) -> Option<SubmarinePair> {
-        self.lbtc.get("L-BTC").cloned()
+        self.get("L-BTC", "L-BTC").cloned()
     }
 
     /// Get the L-USDT to BTC pair data from the response.
     pub fn get_lusdt_to_btc_pair(&self) -> Option<SubmarinePair> {
-        self.lusdt.get("BTC").cloned()
+        self.get("L-USDT", "BTC").cloned()
     }
 
     /// Resolve the Liquid assets committed by the selected public pair card.
@@ -342,8 +355,7 @@ impl GetSubmarinePairsResponse {
     ) -> Result<Option<LiquidAssetContext>, Error> {
         match (from, to) {
             (Currency::LUsdt, Currency::Btc) => self
-                .lusdt
-                .get("BTC")
+                .get("L-USDT", "BTC")
                 .ok_or_else(|| Error::Protocol("L-USDT/BTC submarine pair missing".to_string()))
                 .and_then(|pair| {
                     require_pair_asset_context(
@@ -361,30 +373,38 @@ impl GetSubmarinePairsResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `from` currency → `to` currency → pair. See [`GetSubmarinePairsResponse`]
+/// for why this is a map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct GetReversePairsResponse {
-    // `default`: tolerate a maker with no BTC reverse pairs (see the
-    // submarine-pairs note).
-    #[serde(rename = "BTC", default)]
-    pub btc: HashMap<String, ReversePair>,
+    pub pairs: HashMap<String, HashMap<String, ReversePair>>,
 }
 
 impl GetReversePairsResponse {
+    /// The pair for one `from`/`to` currency pair, if the server serves it.
+    ///
+    /// The general lookup the named accessors below are shorthand for. Use it
+    /// for currencies that have no named accessor.
+    pub fn get(&self, from: &str, to: &str) -> Option<&ReversePair> {
+        self.pairs.get(from)?.get(to)
+    }
+
     /// Get the BtcBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_btc_to_btc_pair(&self) -> Option<ReversePair> {
-        self.btc.get("BTC").cloned()
+        self.get("BTC", "BTC").cloned()
     }
 
     /// Get the BtcLBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_btc_to_lbtc_pair(&self) -> Option<ReversePair> {
-        self.btc.get("L-BTC").cloned()
+        self.get("BTC", "L-BTC").cloned()
     }
 
     /// Get the BTC to L-USDT pair data from the response.
     pub fn get_btc_to_lusdt_pair(&self) -> Option<ReversePair> {
-        self.btc.get("L-USDT").cloned()
+        self.get("BTC", "L-USDT").cloned()
     }
 
     /// Resolve the Liquid assets committed by the selected public pair card.
@@ -395,8 +415,7 @@ impl GetReversePairsResponse {
     ) -> Result<Option<LiquidAssetContext>, Error> {
         match (from, to) {
             (Currency::Btc, Currency::LUsdt) => self
-                .btc
-                .get("L-USDT")
+                .get("BTC", "L-USDT")
                 .ok_or_else(|| Error::Protocol("BTC/L-USDT reverse pair missing".to_string()))
                 .and_then(|pair| {
                     require_pair_asset_context(
@@ -414,31 +433,38 @@ impl GetReversePairsResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `from` currency → `to` currency → pair. See [`GetSubmarinePairsResponse`]
+/// for why this is a map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct GetChainPairsResponse {
-    // `default`: see the submarine-pairs note.
-    #[serde(rename = "BTC", default)]
-    pub btc: HashMap<String, ChainPair>,
-    #[serde(rename = "L-BTC", default)]
-    pub lbtc: HashMap<String, ChainPair>,
+    pub pairs: HashMap<String, HashMap<String, ChainPair>>,
 }
 
 impl GetChainPairsResponse {
+    /// The pair for one `from`/`to` currency pair, if the server serves it.
+    ///
+    /// The general lookup the named accessors below are shorthand for. Use it
+    /// for currencies that have no named accessor.
+    pub fn get(&self, from: &str, to: &str) -> Option<&ChainPair> {
+        self.pairs.get(from)?.get(to)
+    }
+
     /// Get the BtcLBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_btc_to_lbtc_pair(&self) -> Option<ChainPair> {
-        self.btc.get("L-BTC").cloned()
+        self.get("BTC", "L-BTC").cloned()
     }
 
     /// Get the LBtcBtc Pair data from the response.
     /// Returns None if not found.
     pub fn get_lbtc_to_btc_pair(&self) -> Option<ChainPair> {
-        self.lbtc.get("BTC").cloned()
+        self.get("L-BTC", "BTC").cloned()
     }
 
     /// Get the BTC to L-USDT atomic pair data from the response.
     pub fn get_btc_to_lusdt_pair(&self) -> Option<ChainPair> {
-        self.btc.get("L-USDT").cloned()
+        self.get("BTC", "L-USDT").cloned()
     }
 
     /// Resolve the Liquid assets committed by the selected public pair card.
@@ -449,8 +475,7 @@ impl GetChainPairsResponse {
     ) -> Result<Option<LiquidAssetContext>, Error> {
         match (from, to) {
             (Currency::Btc, Currency::LUsdt) => self
-                .btc
-                .get("L-USDT")
+                .get("BTC", "L-USDT")
                 .ok_or_else(|| Error::Protocol("BTC/L-USDT chain pair missing".to_string()))
                 .and_then(|pair| {
                     require_pair_asset_context(
@@ -2899,6 +2924,76 @@ mod tests {
 
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A currency the SDK has no named accessor for must still survive
+    /// deserialization and stay reachable.
+    ///
+    /// The pair maps used to be one struct field per currency, so serde
+    /// dropped every unknown key without a word — an `ARKD` submarine route
+    /// the server published simply never reached the caller, and the map came
+    /// back one entry shorter with nothing to indicate why. Both directions
+    /// are asserted: `to`-side currencies were always fine (they live inside
+    /// the inner map), and pinning that here keeps a future refactor from
+    /// re-introducing a struct on either level.
+    #[test]
+    fn pair_maps_keep_currencies_without_a_named_accessor() {
+        let sub_pair = |hash: &str, rate: f64| {
+            serde_json::json!({
+                "hash": hash,
+                "rate": rate,
+                "limits": { "maximal": 25_000_000, "minimal": 10_000, "maximalZeroConf": 0 },
+                "fees": { "percentage": 0.5, "minerFees": 1_000 },
+            })
+        };
+        let raw = serde_json::json!({
+            "ARKD":   { "BTC": sub_pair("h1", 1.0) },
+            "L-USDT": { "BTC": sub_pair("h2", 0.000012) },
+        });
+        let parsed: GetSubmarinePairsResponse = serde_json::from_value(raw).unwrap();
+
+        assert!(
+            parsed.get("ARKD", "BTC").is_some(),
+            "ARKD -> BTC was dropped: {:?}",
+            parsed.pairs.keys().collect::<Vec<_>>()
+        );
+        // The named accessor for a known currency still resolves.
+        assert!(parsed.get_lusdt_to_btc_pair().is_some());
+        // Serializing puts every currency back at the top level, so a response
+        // that is parsed and re-emitted keeps its routes. (Field-level shape is
+        // covered elsewhere; this asserts the currency keys specifically.)
+        let round_tripped = serde_json::to_value(&parsed).unwrap();
+        let mut keys: Vec<_> = round_tripped.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["ARKD".to_string(), "L-USDT".to_string()]);
+
+        // Chain: the source side is where the drop happened (`L-USDT` and
+        // `ARKD` both lacked a field), so assert a non-BTC source survives.
+        let chain: GetChainPairsResponse = serde_json::from_value(serde_json::json!({
+            "L-USDT": { "L-BTC": {
+                "hash": "h3",
+                "rate": 1.0,
+                "limits": { "maximal": 25_000_000, "minimal": 10_000, "maximalZeroConf": 0 },
+                "fees": {
+                    "percentage": 0.5,
+                    "minerFees": { "server": 1_000, "user": { "lockup": 500, "claim": 500 } },
+                },
+            } },
+        }))
+        .unwrap();
+        assert!(chain.get("L-USDT", "L-BTC").is_some());
+
+        // Reverse: unknown `to` currencies were never dropped — keep it that way.
+        let reverse: GetReversePairsResponse = serde_json::from_value(serde_json::json!({
+            "BTC": { "ARKD": {
+                "hash": "h4",
+                "rate": 1.0,
+                "limits": { "maximal": 25_000_000, "minimal": 10_000 },
+                "fees": { "percentage": 0.5, "minerFees": { "lockup": 500, "claim": 500 } },
+            } },
+        }))
+        .unwrap();
+        assert!(reverse.get("BTC", "ARKD").is_some());
+    }
 
     /// Every endpoint `default()` hands out must be a KaleidoSwap maker, and it
     /// must be on the same chain as that network's default chain access — see
