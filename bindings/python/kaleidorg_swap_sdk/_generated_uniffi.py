@@ -3353,20 +3353,16 @@ class _UniffiConverterTypeFundedLiquidPset(_UniffiConverterRustBuffer):
 
 
 class GetChainPairsResponse:
-    btc: "dict[str, ChainPair]"
-    lbtc: "dict[str, ChainPair]"
+    pairs: "dict[str, dict[str, ChainPair]]"
 
-    def __init__(self, *, btc: "dict[str, ChainPair]", lbtc: "dict[str, ChainPair]"):
-        self.btc = btc
-        self.lbtc = lbtc
+    def __init__(self, *, pairs: "dict[str, dict[str, ChainPair]]"):
+        self.pairs = pairs
 
     def __str__(self):
-        return "GetChainPairsResponse(btc={}, lbtc={})".format(self.btc, self.lbtc)
+        return "GetChainPairsResponse(pairs={})".format(self.pairs)
 
     def __eq__(self, other):
-        if self.btc != other.btc:
-            return False
-        if self.lbtc != other.lbtc:
+        if self.pairs != other.pairs:
             return False
         return True
 
@@ -3375,32 +3371,29 @@ class _UniffiConverterTypeGetChainPairsResponse(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return GetChainPairsResponse(
-            btc=_UniffiConverterMapStringTypeChainPair.read(buf),
-            lbtc=_UniffiConverterMapStringTypeChainPair.read(buf),
+            pairs=_UniffiConverterMapStringMapStringTypeChainPair.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
-        _UniffiConverterMapStringTypeChainPair.check_lower(value.btc)
-        _UniffiConverterMapStringTypeChainPair.check_lower(value.lbtc)
+        _UniffiConverterMapStringMapStringTypeChainPair.check_lower(value.pairs)
 
     @staticmethod
     def write(value, buf):
-        _UniffiConverterMapStringTypeChainPair.write(value.btc, buf)
-        _UniffiConverterMapStringTypeChainPair.write(value.lbtc, buf)
+        _UniffiConverterMapStringMapStringTypeChainPair.write(value.pairs, buf)
 
 
 class GetReversePairsResponse:
-    btc: "dict[str, ReversePair]"
+    pairs: "dict[str, dict[str, ReversePair]]"
 
-    def __init__(self, *, btc: "dict[str, ReversePair]"):
-        self.btc = btc
+    def __init__(self, *, pairs: "dict[str, dict[str, ReversePair]]"):
+        self.pairs = pairs
 
     def __str__(self):
-        return "GetReversePairsResponse(btc={})".format(self.btc)
+        return "GetReversePairsResponse(pairs={})".format(self.pairs)
 
     def __eq__(self, other):
-        if self.btc != other.btc:
+        if self.pairs != other.pairs:
             return False
         return True
 
@@ -3409,45 +3402,29 @@ class _UniffiConverterTypeGetReversePairsResponse(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return GetReversePairsResponse(
-            btc=_UniffiConverterMapStringTypeReversePair.read(buf),
+            pairs=_UniffiConverterMapStringMapStringTypeReversePair.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
-        _UniffiConverterMapStringTypeReversePair.check_lower(value.btc)
+        _UniffiConverterMapStringMapStringTypeReversePair.check_lower(value.pairs)
 
     @staticmethod
     def write(value, buf):
-        _UniffiConverterMapStringTypeReversePair.write(value.btc, buf)
+        _UniffiConverterMapStringMapStringTypeReversePair.write(value.pairs, buf)
 
 
 class GetSubmarinePairsResponse:
-    btc: "dict[str, SubmarinePair]"
-    lbtc: "dict[str, SubmarinePair]"
-    lusdt: "dict[str, SubmarinePair]"
+    pairs: "dict[str, dict[str, SubmarinePair]]"
 
-    def __init__(
-        self,
-        *,
-        btc: "dict[str, SubmarinePair]",
-        lbtc: "dict[str, SubmarinePair]",
-        lusdt: "dict[str, SubmarinePair]",
-    ):
-        self.btc = btc
-        self.lbtc = lbtc
-        self.lusdt = lusdt
+    def __init__(self, *, pairs: "dict[str, dict[str, SubmarinePair]]"):
+        self.pairs = pairs
 
     def __str__(self):
-        return "GetSubmarinePairsResponse(btc={}, lbtc={}, lusdt={})".format(
-            self.btc, self.lbtc, self.lusdt
-        )
+        return "GetSubmarinePairsResponse(pairs={})".format(self.pairs)
 
     def __eq__(self, other):
-        if self.btc != other.btc:
-            return False
-        if self.lbtc != other.lbtc:
-            return False
-        if self.lusdt != other.lusdt:
+        if self.pairs != other.pairs:
             return False
         return True
 
@@ -3456,22 +3433,16 @@ class _UniffiConverterTypeGetSubmarinePairsResponse(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return GetSubmarinePairsResponse(
-            btc=_UniffiConverterMapStringTypeSubmarinePair.read(buf),
-            lbtc=_UniffiConverterMapStringTypeSubmarinePair.read(buf),
-            lusdt=_UniffiConverterMapStringTypeSubmarinePair.read(buf),
+            pairs=_UniffiConverterMapStringMapStringTypeSubmarinePair.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
-        _UniffiConverterMapStringTypeSubmarinePair.check_lower(value.btc)
-        _UniffiConverterMapStringTypeSubmarinePair.check_lower(value.lbtc)
-        _UniffiConverterMapStringTypeSubmarinePair.check_lower(value.lusdt)
+        _UniffiConverterMapStringMapStringTypeSubmarinePair.check_lower(value.pairs)
 
     @staticmethod
     def write(value, buf):
-        _UniffiConverterMapStringTypeSubmarinePair.write(value.btc, buf)
-        _UniffiConverterMapStringTypeSubmarinePair.write(value.lbtc, buf)
-        _UniffiConverterMapStringTypeSubmarinePair.write(value.lusdt, buf)
+        _UniffiConverterMapStringMapStringTypeSubmarinePair.write(value.pairs, buf)
 
 
 class Leaf:
@@ -5818,6 +5789,102 @@ class _UniffiConverterMapStringTypeSubmarinePair(_UniffiConverterRustBuffer):
         for i in range(count):
             key = _UniffiConverterString.read(buf)
             val = _UniffiConverterTypeSubmarinePair.read(buf)
+            d[key] = val
+        return d
+
+
+class _UniffiConverterMapStringMapStringTypeChainPair(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, items):
+        for key, value in items.items():
+            _UniffiConverterString.check_lower(key)
+            _UniffiConverterMapStringTypeChainPair.check_lower(value)
+
+    @classmethod
+    def write(cls, items, buf):
+        buf.write_i32(len(items))
+        for key, value in items.items():
+            _UniffiConverterString.write(key, buf)
+            _UniffiConverterMapStringTypeChainPair.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative map size")
+
+        # It would be nice to use a dict comprehension,
+        # but in Python 3.7 and before the evaluation order is not according to spec,
+        # so we we're reading the value before the key.
+        # This loop makes the order explicit: first reading the key, then the value.
+        d = {}
+        for i in range(count):
+            key = _UniffiConverterString.read(buf)
+            val = _UniffiConverterMapStringTypeChainPair.read(buf)
+            d[key] = val
+        return d
+
+
+class _UniffiConverterMapStringMapStringTypeReversePair(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, items):
+        for key, value in items.items():
+            _UniffiConverterString.check_lower(key)
+            _UniffiConverterMapStringTypeReversePair.check_lower(value)
+
+    @classmethod
+    def write(cls, items, buf):
+        buf.write_i32(len(items))
+        for key, value in items.items():
+            _UniffiConverterString.write(key, buf)
+            _UniffiConverterMapStringTypeReversePair.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative map size")
+
+        # It would be nice to use a dict comprehension,
+        # but in Python 3.7 and before the evaluation order is not according to spec,
+        # so we we're reading the value before the key.
+        # This loop makes the order explicit: first reading the key, then the value.
+        d = {}
+        for i in range(count):
+            key = _UniffiConverterString.read(buf)
+            val = _UniffiConverterMapStringTypeReversePair.read(buf)
+            d[key] = val
+        return d
+
+
+class _UniffiConverterMapStringMapStringTypeSubmarinePair(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, items):
+        for key, value in items.items():
+            _UniffiConverterString.check_lower(key)
+            _UniffiConverterMapStringTypeSubmarinePair.check_lower(value)
+
+    @classmethod
+    def write(cls, items, buf):
+        buf.write_i32(len(items))
+        for key, value in items.items():
+            _UniffiConverterString.write(key, buf)
+            _UniffiConverterMapStringTypeSubmarinePair.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative map size")
+
+        # It would be nice to use a dict comprehension,
+        # but in Python 3.7 and before the evaluation order is not according to spec,
+        # so we we're reading the value before the key.
+        # This loop makes the order explicit: first reading the key, then the value.
+        d = {}
+        for i in range(count):
+            key = _UniffiConverterString.read(buf)
+            val = _UniffiConverterMapStringTypeSubmarinePair.read(buf)
             d[key] = val
         return d
 
