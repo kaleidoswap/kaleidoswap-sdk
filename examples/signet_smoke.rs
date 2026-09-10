@@ -34,7 +34,7 @@ async fn main() -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?;
     println!(
         "[ok] GET /v2/swap/reverse: {} reverse pairs",
-        rev_pairs.btc.len()
+        rev_pairs.pairs.get("BTC").map_or(0, |m| m.len())
     );
 
     // (4) maker chain tip vs the SDK's *default* signet chain access. These

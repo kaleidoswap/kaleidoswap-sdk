@@ -678,18 +678,15 @@ pub struct SubmarinePair {
 
 #[uniffi::remote(Record)]
 pub struct GetSubmarinePairsResponse {
-    pub btc: HashMap<String, SubmarinePair>,
-    pub lbtc: HashMap<String, SubmarinePair>,
-    pub lusdt: HashMap<String, SubmarinePair>,
+    pub pairs: HashMap<String, HashMap<String, SubmarinePair>>,
 }
 
 #[uniffi::remote(Record)]
 pub struct GetReversePairsResponse {
-    pub btc: HashMap<String, ReversePair>,
+    pub pairs: HashMap<String, HashMap<String, ReversePair>>,
 }
 
 #[uniffi::remote(Record)]
 pub struct GetChainPairsResponse {
-    pub btc: HashMap<String, ChainPair>,
-    pub lbtc: HashMap<String, ChainPair>,
+    pub pairs: HashMap<String, HashMap<String, ChainPair>>,
 }
