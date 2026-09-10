@@ -308,7 +308,11 @@ fn pair_responses_accept_omitted_empty_currency_buckets() {
         "L-USDT": value_at(&fixture, "/pairResponses/submarine/L-USDT")
     }))
     .unwrap();
-    assert!(submarine.pairs.is_empty());
+    // The omitted currencies are simply absent — the tolerance the old
+    // `default` attributes provided, now inherent in the map — and the one
+    // the body does carry parses.
+    assert!(submarine.pairs.get("BTC").is_none());
+    assert!(submarine.pairs.get("L-BTC").is_none());
     assert!(submarine.get_lusdt_to_btc_pair().is_some());
 
     let reverse: GetReversePairsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
