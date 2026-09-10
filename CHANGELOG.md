@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-09-10
+
+### Breaking — pair maps keep every currency the server sends
+
+`GetSubmarinePairsResponse` and `GetChainPairsResponse` modelled the pair map
+as a struct with one field per source currency — `BTC`, `L-BTC`, `L-USDT` for
+submarine; `BTC`, `L-BTC` for chain. Serde drops a key with no matching field,
+and an unknown key is not an error, so a route the server published never
+reached the caller. The map simply came back shorter, with nothing to say why.
+
+Against a maker publishing four source currencies on both endpoints:
+
+| | before | after |
+|---|---|---|
+| `submarine_pairs()` | `BTC, L-BTC, L-USDT` | `ARKD, BTC, L-BTC, L-USDT` |
+| `chain_pairs()` | `BTC, L-BTC` | `ARKD, BTC, L-BTC, L-USDT` |
+
+`ARKD → BTC` was a live, quotable submarine route that no caller of this SDK
+could see.
+
+Only the **source** side was affected, which is what made it look
+intermittent. Reverse routes are all `BTC → X`: their source is the one field
+that existed, and the destination rode through the inner `HashMap`, so
+`BTC → ARKD` always worked. Same venue, opposite direction, different
+outcome. The same asymmetry meant adding a destination venue was free while
+adding a source venue required a release of this crate.
+
+The outer level is now a map, so an unrecognised currency round-trips instead
+of vanishing. A new venue is a server-side change alone.
+
+**What does not move.** `#[serde(transparent)]` keeps the wire shape
+byte-identical in both directions. `bindings-wasm` serializes maps as objects,
+so the JavaScript shape is unchanged — callers read the same object and simply
+find more keys in it. The typed accessors (`get_btc_to_lbtc_pair`,
+`get_lbtc_to_btc_pair`, `get_lusdt_to_btc_pair` and the rest) are unchanged and
+now resolve through the map, so Rust callers using those need no edit. A named
+field keeps the `#[uniffi::remote(Record)]` mirrors valid; the generated Python
+glue gains map-of-map converters and is regenerated in this release.
+
+**What breaks.** Direct field access. `response.btc`, `response.lbtc` and
+`response.lusdt` are replaced by `response.pairs`, keyed by the currency string
+the server sends, plus a `get(from, to)` lookup for currencies that have no
+named accessor:
+
+```rust
+// before
+let pair = pairs.lusdt.get("BTC");
+// after
+let pair = pairs.get("L-USDT", "BTC");
+// or, unchanged
+let pair = pairs.get_lusdt_to_btc_pair();
+```
+
+`GetNodesResponse` has the same shape and is deliberately left alone: the
+maker serves exactly one currency there, so nothing is being dropped, and
+changing it would break callers for no gain.
+
 ## [0.5.0] - 2026-09-08
 
 ### Fixed — `Error` implements `std::error::Error`
