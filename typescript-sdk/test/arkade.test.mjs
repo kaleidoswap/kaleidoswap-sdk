@@ -1,13 +1,20 @@
 // Tests for the `@kaleidorg/swap-sdk/arkade` venue. Run against the built
-// output (`npm test` builds first), with every `@arkade-os/swap` flow faked
-// through the venue's `flows` seam — nothing here talks to a network or a
-// real wallet. The fallback ("stored") secrets arm keeps identity/preimage
-// derivation off the wallet entirely, so `wallet` can be an empty object.
+// output (`npm test` builds first). Everything this venue does NOT own —
+// `@arkade-os/swap`'s `RfqSwapManager` chain-evidence reads (`readLockupFate`,
+// `findLockupVtxos`) — is exercised through a fake `indexerProvider` that
+// answers `getVtxos`/`getVirtualTxs` the way a real Arkade indexer would;
+// everything this venue DOES own (claim/refund dispatch, phase mapping,
+// record persistence) is faked through the venue's own `flows` seam. Nothing
+// here talks to a network or a real wallet — `wallet` can be an empty object
+// because every path that would need it (`contractSigner`,
+// `preimageForSwapRecord`) is reached only from the DEFAULT `flows.claimLockup`
+// / `flows.refundArkade`, which every test below overrides.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 
-import { VHTLC, ArkAddress } from "@arkade-os/sdk";
-import { randomSwapSecrets } from "@arkade-os/swap";
+import { VHTLC, ArkAddress, Transaction } from "@arkade-os/sdk";
+import { LockupNeedsRecoveryError } from "@arkade-os/swap";
 
 import {
   ArkadeIntentsVenue,
@@ -31,6 +38,14 @@ function hexDecode(value) {
   return out;
 }
 
+function hexEncode(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 const NOW = 1_800_000_000;
 
 // A valid P2TR pkScript: OP_1 PUSH32 <x-only key>.
@@ -48,11 +63,8 @@ function vhtlcOptions(overrides = {}) {
     unilateralClaimDelay: { type: "seconds", value: 512n },
     unilateralRefundDelay: { type: "seconds", value: 1024n },
     unilateralRefundWithoutReceiverDelay: { type: "seconds", value: 1536n },
-    nonInteractiveClaim: {
+    nonInteractiveParameters: {
       receiverPkScript: p2tr(XONLY[1]),
-      emulatorPubkey: XONLY[0],
-    },
-    nonInteractiveRefund: {
       senderPkScript: p2tr(XONLY[0]),
       emulatorPubkey: XONLY[0],
     },
@@ -61,6 +73,7 @@ function vhtlcOptions(overrides = {}) {
 }
 
 function quote(overrides = {}) {
+  const { profile, ...rest } = overrides;
   return {
     v: 1,
     type: "rfq_quote",
@@ -71,8 +84,8 @@ function quote(overrides = {}) {
     solver_pubkey: "aa".repeat(32),
     valid_until: NOW + 600,
     refund_locktime: NOW + 3600,
-    profile: { payment_hash: "bb".repeat(32) },
-    ...overrides,
+    ...rest,
+    profile: { payment_hash: "bb".repeat(32), ...profile },
   };
 }
 
@@ -87,10 +100,18 @@ function sendResponse(overrides = {}) {
     script,
     refundAddress: "ark1qrefund",
     senderPubkey: XONLY[0],
-    secrets: randomSwapSecrets(),
+    secrets: {
+      descriptor: "tr(refund-descriptor)",
+      pubkey: XONLY[0],
+      pkScript: p2tr(XONLY[0]),
+      address: "ark1qrefund",
+    },
+    treeParams: {},
     ...overrides,
   };
 }
+
+const RECEIVE_PREIMAGE = new Uint8Array(32).fill(6);
 
 function receiveResponse(overrides = {}) {
   const script = new VHTLC.ScriptV2(vhtlcOptions());
@@ -100,6 +121,7 @@ function receiveResponse(overrides = {}) {
     quote: quote({
       rfq_id: overrides.rfqId ?? "rfq-r1",
       pair: "lightning:BTC->arkade:BTC",
+      profile: { payment_hash: sha256Hex(RECEIVE_PREIMAGE) },
       ...overrides.quote,
     }),
     invoice: "lnbc10n1example",
@@ -111,15 +133,102 @@ function receiveResponse(overrides = {}) {
     script,
     payoutAddress,
     payoutPubkey: XONLY[1],
-    secrets: randomSwapSecrets({ preimage: true }),
+    secrets: {
+      descriptor: "tr(claim-descriptor)",
+      pubkey: XONLY[1],
+      preimage: RECEIVE_PREIMAGE,
+      paymentHash: hexDecode(sha256Hex(RECEIVE_PREIMAGE)),
+      mustPersistPreimage: true,
+    },
+    treeParams: {},
     ...overrides,
   };
+}
+
+/** A generic, always-open (unspent) vtxo — the default answer for the
+ * `indexerProvider` any test that does not care about chain evidence gets.
+ * Large enough to satisfy every `expectedAmountSats` used below. */
+function openVtxo(overrides = {}) {
+  return {
+    txid: "cc".repeat(32),
+    vout: 0,
+    value: 10_000_000,
+    isSpent: false,
+    ...overrides,
+  };
+}
+
+/** Build a fake indexer. `vtxos`/`recoverableVtxos` feed `getVtxos`;
+ * `virtualTxs` (keyed by checkpoint txid) feed `getVirtualTxs` — both used
+ * verbatim regardless of the query's `scripts` filter, which is fine since
+ * every test below drives exactly one swap through the fake at a time. */
+function fakeIndexer({
+  vtxos = [openVtxo()],
+  recoverableVtxos = [],
+  virtualTxs = {},
+} = {}) {
+  return {
+    getVtxos: async (params = {}) => ({
+      vtxos: params.recoverableOnly ? recoverableVtxos : vtxos,
+    }),
+    getVirtualTxs: async (txids) => ({
+      txs: txids.map((id) => virtualTxs[id]).filter(Boolean),
+    }),
+  };
+}
+
+/** A minimal, decodable PSBT spending `lockupTxid:lockupVout` with the given
+ * final witness on its one input — enough for `readLockupFate` to read a
+ * preimage (or not) out of `finalScriptWitness`. Returns both the encoded
+ * PSBT and the transaction's own (real, computed) txid: `readLockupFate`'s
+ * "returned" classification correlates a vtxo's `spentBy` against the
+ * checkpoint's ACTUAL id, not an arbitrary label, so the fake vtxo must name
+ * this same id. */
+function spendTx(lockupTxid, lockupVout, witnessItems) {
+  const tx = new Transaction({
+    allowUnknown: true,
+    allowUnknownOutputs: true,
+    allowLegacyWitnessUtxo: true,
+  });
+  tx.addInput({
+    txid: lockupTxid,
+    index: lockupVout,
+    witnessUtxo: { script: p2tr(XONLY[0]), amount: 1_000n },
+    sequence: 0xfffffffd,
+  });
+  tx.addOutput({ script: p2tr(XONLY[1]), amount: 900n });
+  tx.updateInput(0, { finalScriptWitness: witnessItems });
+  return { psbt: Buffer.from(tx.toPSBT()).toString("base64"), txid: tx.id };
+}
+
+/** A fake indexer whose lockup was fully spent by a witness that does (or does
+ * not) reveal `preimage` — drives the manager's own `readLockupFate` straight
+ * to `claimed`/`returned` without going through this venue's claim/refund
+ * seam at all (the "counterparty already resolved it" / "chain confirms our
+ * own claim" path). */
+function spentLockupIndexer({ lockupTxid, preimage, revealed }) {
+  const witness = revealed ? [preimage] : [new Uint8Array(32).fill(0xee)];
+  const { psbt, txid: checkpointTxid } = spendTx(lockupTxid, 0, witness);
+  return fakeIndexer({
+    vtxos: [
+      {
+        txid: lockupTxid,
+        vout: 0,
+        value: 1_050,
+        spentBy: checkpointTxid,
+        isSpent: true,
+        arkTxId: "resolved-ark-tx",
+      },
+    ],
+    virtualTxs: { [checkpointTxid]: psbt },
+  });
 }
 
 function makeVenue({
   flows = {},
   now = () => NOW,
   store = new InMemoryArkadeSwapStore(),
+  indexerProvider = fakeIndexer(),
 } = {}) {
   const venue = new ArkadeIntentsVenue({
     wallet: {},
@@ -127,33 +236,105 @@ function makeVenue({
     transport: {},
     store,
     arkProvider: {},
-    indexerProvider: {},
+    indexerProvider,
     now,
     flows: {
       requestLightningSend: async () => sendResponse(),
       requestLightningReceive: async () => receiveResponse(),
-      claimReceiveLockup: async () => ({ arkTxid: "claim-tx", amount: 1_000 }),
-      refundIfUnresolved: async () => ({
-        outcome: "nothing_to_refund",
-        status: null,
-      }),
-      readLockupFate: async () => ({ fate: "open" }),
+      claimLockup: async () => ({ arkTxid: "claim-tx", amount: 1_000 }),
+      refundArkade: async () => null,
       ...flows,
     },
   });
   return { venue, store };
 }
 
-test("vhtlc options survive the serialize/deserialize round trip", () => {
+// ─── VHTLC option serialization ─────────────────────────────────────────────
+
+test("vhtlc options survive the serialize/deserialize round trip (current shape)", () => {
   const options = vhtlcOptions();
-  const back = deserializeVhtlcOptions(serializeVhtlcOptions(options));
-  assert.deepEqual(back, options);
-  // And the rebuilt covenant is byte-identical where it matters.
+  const serialized = serializeVhtlcOptions(options);
+  assert.equal(serialized.nonInteractiveParameters.legacy, "current");
+  const back = deserializeVhtlcOptions(serialized);
   const a = new VHTLC.ScriptV2(options);
   const b = new VHTLC.ScriptV2(back);
   assert.equal(a.claimScript, b.claimScript);
   assert.equal(a.refundScript, b.refundScript);
+  // The current shape carries the third (timelocked, no-receiver-needed)
+  // non-interactive leaf.
+  assert.ok(a.nonInteractiveRefundWithoutReceiverScript);
+  assert.ok(b.nonInteractiveRefundWithoutReceiverScript);
 });
+
+test("vhtlc options survive the round trip in the legacy (pre-timelocked-refund) shape", () => {
+  const options = vhtlcOptions({
+    nonInteractiveParameters: {
+      ...vhtlcOptions().nonInteractiveParameters,
+      legacy: "preTimelockedRefund",
+    },
+  });
+  const serialized = serializeVhtlcOptions(options);
+  assert.equal(
+    serialized.nonInteractiveParameters.legacy,
+    "preTimelockedRefund",
+  );
+  const back = deserializeVhtlcOptions(serialized);
+  const a = new VHTLC.ScriptV2(options);
+  const b = new VHTLC.ScriptV2(back);
+  assert.equal(a.claimScript, b.claimScript);
+  assert.equal(
+    a.address("ark", XONLY[2]).encode(),
+    b.address("ark", XONLY[2]).encode(),
+  );
+  // The legacy shape has no third leaf at all.
+  assert.equal(a.nonInteractiveRefundWithoutReceiverScript, undefined);
+  assert.equal(b.nonInteractiveRefundWithoutReceiverScript, undefined);
+});
+
+test("a serialized record with no legacy key at all decodes as legacy, never as current", () => {
+  const options = vhtlcOptions();
+  const serialized = serializeVhtlcOptions(options);
+  // Simulate a record written before this field existed: strip the key
+  // entirely rather than setting it to any particular value.
+  delete serialized.nonInteractiveParameters.legacy;
+  const back = deserializeVhtlcOptions(serialized);
+  assert.equal(back.nonInteractiveParameters.legacy, "preTimelockedRefund");
+  const rebuilt = new VHTLC.ScriptV2(back);
+  assert.equal(rebuilt.nonInteractiveRefundWithoutReceiverScript, undefined);
+});
+
+test("a legacy-shaped record (old nonInteractiveClaim/nonInteractiveRefund fields) migrates to legacy", () => {
+  const options = vhtlcOptions();
+  const serialized = serializeVhtlcOptions(options);
+  const oldShape = {
+    senderHex: serialized.senderHex,
+    receiverHex: serialized.receiverHex,
+    serverHex: serialized.serverHex,
+    preimageHashHex: serialized.preimageHashHex,
+    refundLocktime: serialized.refundLocktime,
+    unilateralClaimDelay: serialized.unilateralClaimDelay,
+    unilateralRefundDelay: serialized.unilateralRefundDelay,
+    unilateralRefundWithoutReceiverDelay:
+      serialized.unilateralRefundWithoutReceiverDelay,
+    nonInteractiveClaim: {
+      receiverPkScriptHex:
+        serialized.nonInteractiveParameters.receiverPkScriptHex,
+      emulatorPubkeyHex: serialized.nonInteractiveParameters.emulatorPubkeyHex,
+    },
+    nonInteractiveRefund: {
+      senderPkScriptHex: serialized.nonInteractiveParameters.senderPkScriptHex,
+      emulatorPubkeyHex: serialized.nonInteractiveParameters.emulatorPubkeyHex,
+    },
+  };
+  const back = deserializeVhtlcOptions(oldShape);
+  assert.equal(back.nonInteractiveParameters.legacy, "preTimelockedRefund");
+  assert.equal(
+    hexEncode(back.nonInteractiveParameters.emulatorPubkey),
+    hexEncode(XONLY[0]),
+  );
+});
+
+// ─── prepare / notifyFunded ─────────────────────────────────────────────────
 
 test("prepareLightningSend persists the record before returning", async () => {
   const { venue, store } = makeVenue();
@@ -162,6 +343,7 @@ test("prepareLightningSend persists the record before returning", async () => {
   assert.ok(stored, "record persisted");
   assert.equal(stored.phase, "prepared");
   assert.equal(stored.fundAmountSats, 1_050);
+  assert.equal(stored.secrets.signingDescriptor, "tr(refund-descriptor)");
   assert.equal(prepared.summary.feeSats, 50);
   assert.equal(prepared.summary.venue, "arkade-intents");
   assert.equal(prepared.address, "ark1qexample");
@@ -182,241 +364,27 @@ test("a store failure surfaces before any funding instruction exists", async () 
   );
 });
 
-test("notifyFunded records the commitment", async () => {
-  const { venue } = makeVenue();
+test("prepareLightningReceive persists secrets and payment hash material", async () => {
+  const { venue, store } = makeVenue();
+  const prepared = await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  const stored = await store.get("rfq-r1");
+  assert.equal(stored.phase, "prepared");
+  assert.equal(stored.expectedAmountSats, 1_000);
+  assert.equal(stored.secrets.signingDescriptor, "tr(claim-descriptor)");
+  assert.equal(stored.secrets.preimageHex, hexEncode(RECEIVE_PREIMAGE));
+  assert.equal(prepared.invoice, "lnbc10n1example");
+});
+
+test("notifyFunded records the commitment and hands the swap to the manager", async () => {
+  const { venue, store } = makeVenue();
   await venue.prepareLightningSend({ invoice: {} });
   const record = await venue.notifyFunded("rfq-1", "funding-txid");
   assert.equal(record.phase, "funded");
   assert.equal(record.fundingTxid, "funding-txid");
-});
-
-test("reconcile cancels an expired send only when the chain saw no lockup", async () => {
-  const { venue, store } = makeVenue({
-    now: () => NOW + 601,
-    flows: { readLockupFate: async () => ({ fate: "unknown" }) },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  const report = await venue.reconcile();
-  assert.deepEqual(report.cancelled, ["rfq-1"]);
-  assert.equal((await store.get("rfq-1")).phase, "cancelled");
-});
-
-test("a prepared send whose lockup is live self-heals to funded", async () => {
-  // Funding is acceptance: the host can broadcast and crash before
-  // notifyFunded. The record must never leave the pending set while the
-  // chain shows a live lockup.
-  const { venue, store } = makeVenue({
-    now: () => NOW + 601, // past valid_until, before refund_locktime
-    flows: { readLockupFate: async () => ({ fate: "open" }) },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  const report = await venue.reconcile();
-  assert.deepEqual(report.pending, ["rfq-1"]);
   assert.equal((await store.get("rfq-1")).phase, "funded");
-});
-
-test("a crashed-before-notify send still refunds after the locktime", async () => {
-  const { venue, store } = makeVenue({
-    now: () => NOW + 3601,
-    flows: {
-      readLockupFate: async () => ({ fate: "open" }),
-      refundIfUnresolved: async () => ({
-        outcome: "refunded",
-        arkTxid: "late-refund-tx",
-        amount: 1_050,
-        status: null,
-      }),
-    },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  // No notifyFunded at all — reconcile alone must recover the funds.
-  const report = await venue.reconcile();
-  assert.deepEqual(report.refunded, ["rfq-1"]);
-  assert.equal((await store.get("rfq-1")).resolvedTxid, "late-refund-tx");
-});
-
-test("reconcile settles a funded send whose lockup was claimed", async () => {
-  const { venue } = makeVenue({
-    flows: {
-      readLockupFate: async () => ({
-        fate: "claimed",
-        preimage: new Uint8Array(32),
-      }),
-    },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  await venue.notifyFunded("rfq-1", "tx");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.settled, ["rfq-1"]);
-});
-
-test("reconcile refunds a matured send through refundIfUnresolved", async () => {
-  const { venue, store } = makeVenue({
-    now: () => NOW + 3601,
-    flows: {
-      refundIfUnresolved: async () => ({
-        outcome: "refunded",
-        arkTxid: "refund-tx",
-        amount: 1_050,
-        status: null,
-      }),
-    },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  await venue.notifyFunded("rfq-1", "tx");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.refunded, ["rfq-1"]);
-  const record = await store.get("rfq-1");
-  assert.equal(record.resolvedTxid, "refund-tx");
-});
-
-test("a swept lockup lands in needs_recovery with its outpoints", async () => {
-  const { venue, store } = makeVenue({
-    now: () => NOW + 3601,
-    flows: {
-      refundIfUnresolved: async () => ({
-        outcome: "needs_recovery",
-        outpoints: ["deadbeef:0"],
-        vtxos: [],
-        status: null,
-      }),
-    },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  await venue.notifyFunded("rfq-1", "tx");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.needsRecovery, ["rfq-1"]);
-  assert.deepEqual((await store.get("rfq-1")).recoveryOutpoints, [
-    "deadbeef:0",
-  ]);
-});
-
-test("reconcile claims a funded receive and settles it", async () => {
-  let claimInput;
-  const { venue, store } = makeVenue({
-    flows: {
-      claimReceiveLockup: async (_indexer, _ark, input) => {
-        claimInput = input;
-        return { arkTxid: "claim-tx", amount: 1_000 };
-      },
-    },
-  });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  await venue.notifyFunded("rfq-r1");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.settled, ["rfq-r1"]);
-  assert.equal((await store.get("rfq-r1")).resolvedTxid, "claim-tx");
-  assert.equal(claimInput.expectedAmount, 1_000);
-  // The claim deadline never exceeds the solver's refund horizon.
-  assert.ok(claimInput.deadline <= NOW + 3600);
-});
-
-test("a receive past the claim window settles when covclaimd claimed it", async () => {
-  // covclaimdPubkey exists so the solver's claim daemon can claim while the
-  // wallet is offline; that claim IS the settlement, even if this venue
-  // only learns about it after refund_locktime.
-  const { venue, store } = makeVenue({
-    now: () => NOW + 3601,
-    flows: {
-      readLockupFate: async () => ({
-        fate: "claimed",
-        preimage: new Uint8Array(32),
-      }),
-    },
-  });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  await venue.notifyFunded("rfq-r1");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.settled, ["rfq-r1"]);
-  assert.equal((await store.get("rfq-r1")).phase, "settled");
-});
-
-test("a receive past the claim window cancels only when never funded", async () => {
-  const { venue } = makeVenue({
-    now: () => NOW + 3601,
-    flows: { readLockupFate: async () => ({ fate: "unknown" }) },
-  });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  await venue.notifyFunded("rfq-r1");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.cancelled, ["rfq-r1"]);
-});
-
-test("a receive still open past the deadline keeps watching", async () => {
-  // Claiming past refund_locktime races the solver's refund; the lockup is
-  // the solver's to resolve, so the record stays pending until the chain
-  // shows claimed or returned.
-  const { venue, store } = makeVenue({
-    now: () => NOW + 3601,
-    flows: { readLockupFate: async () => ({ fate: "open" }) },
-  });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  await venue.notifyFunded("rfq-r1");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.pending, ["rfq-r1"]);
-  assert.equal((await store.get("rfq-r1")).phase, "funded");
-});
-
-test("reconcile cancels an unpaid receive after invoice expiry", async () => {
-  const { venue } = makeVenue({ now: () => NOW + 301 });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  const report = await venue.reconcile();
-  assert.deepEqual(report.cancelled, ["rfq-r1"]);
-});
-
-test("one record's failure never blocks the rest of the pass", async () => {
-  const { venue } = makeVenue({
-    flows: {
-      readLockupFate: async () => {
-        throw new Error("indexer down");
-      },
-      requestLightningSend: async () => sendResponse(),
-    },
-  });
-  await venue.prepareLightningSend({ invoice: {} });
-  await venue.notifyFunded("rfq-1", "tx");
-  const report = await venue.reconcile();
-  assert.equal(report.errors.length, 1);
-  assert.equal(report.errors[0].id, "rfq-1");
-});
-
-test("a claim past the wait window leaves the receive pending", async () => {
-  const { venue, store } = makeVenue({
-    flows: {
-      claimReceiveLockup: async () => {
-        throw new Error("funding_wait_deadline");
-      },
-    },
-  });
-  await venue.prepareLightningReceive({
-    amountSats: 1_000,
-    covclaimdPubkey: new Uint8Array(33).fill(2),
-    decodeInvoice: () => ({}),
-  });
-  await venue.notifyFunded("rfq-r1");
-  const report = await venue.reconcile();
-  assert.deepEqual(report.pending, ["rfq-r1"]);
-  assert.equal((await store.get("rfq-r1")).phase, "funded");
 });
 
 test("notifyFunded refuses to resurrect a terminal record", async () => {
@@ -434,83 +402,391 @@ test("notifyFunded refuses to resurrect a terminal record", async () => {
   assert.equal(updated.phase, "funded");
 });
 
-test("nothing_to_refund maps through chain evidence, not fundingTxid", async () => {
-  const fateCase = async (fate, expectedPhase) => {
-    const { venue, store } = makeVenue({
-      now: () => NOW + 3601,
-      flows: {
-        refundIfUnresolved: async () => ({
-          outcome: "nothing_to_refund",
-          status: null,
-        }),
-        readLockupFate: async () =>
-          fate === "claimed"
-            ? { fate, preimage: new Uint8Array(32) }
-            : { fate },
-      },
-    });
-    await venue.prepareLightningSend({ invoice: {} });
-    // notifyFunded WITHOUT a txid — the shape the old shortcut misread.
-    await venue.notifyFunded("rfq-1");
-    await venue.refundSend("rfq-1");
-    assert.equal(
-      (await store.get("rfq-1")).phase,
-      expectedPhase,
-      `fate ${fate}`,
-    );
-  };
-  await fateCase("claimed", "settled");
-  await fateCase("returned", "refunded");
-  await fateCase("unknown", "cancelled");
+// ─── prepared-record fast path (self-heal / cancel before the manager) ─────
+
+test("reconcile cancels an expired send only when the chain saw no lockup", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 601,
+    flows: { readLockupFate: async () => ({ fate: "unknown" }) },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  const report = await venue.reconcile();
+  assert.deepEqual(report.cancelled, ["rfq-1"]);
+  assert.equal((await store.get("rfq-1")).phase, "cancelled");
 });
 
-test("concurrent reconcile calls share one pass", async () => {
-  let fateCalls = 0;
-  const { venue } = makeVenue({
+test("a prepared send whose lockup is live self-heals to funded and is tracked", async () => {
+  // Funding is acceptance: the host can broadcast and crash before
+  // notifyFunded. The record must never leave the pending set while the
+  // chain shows a live lockup.
+  const { venue, store } = makeVenue({
+    now: () => NOW + 601, // past valid_until, before refund_locktime
+    flows: { readLockupFate: async () => ({ fate: "open" }) },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  const report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-1"]);
+  assert.equal((await store.get("rfq-1")).phase, "funded");
+});
+
+test("reconcile cancels an unpaid receive after invoice expiry with no chain trace", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 301,
+    flows: { readLockupFate: async () => ({ fate: "unknown" }) },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  const report = await venue.reconcile();
+  assert.deepEqual(report.cancelled, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).phase, "cancelled");
+});
+
+test("a prepared receive that got secretly funded before notifyFunded self-heals", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 301, // past invoiceExpiresAt
+    flows: { readLockupFate: async () => ({ fate: "open" }) },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  const report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).phase, "funded");
+});
+
+test("a transient readLockupFate failure on a prepared record retries next pass", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 601,
     flows: {
       readLockupFate: async () => {
-        fateCalls += 1;
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        return { fate: "open" };
+        throw new Error("indexer down");
       },
     },
   });
   await venue.prepareLightningSend({ invoice: {} });
-  await venue.notifyFunded("rfq-1", "tx");
-  const [a, b] = await Promise.all([venue.reconcile(), venue.reconcile()]);
-  assert.equal(a, b, "second caller joins the running pass");
-  assert.equal(fateCalls, 1, "records are read once, not raced");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-1"]);
+  assert.equal((await store.get("rfq-1")).phase, "prepared");
+  assert.equal(report.errors.length, 0);
 });
 
-test("a quote without refund_locktime falls back to the covenant's", async () => {
-  let refundInput;
+// ─── funded send: settle / refund / cancel via the manager ─────────────────
+
+test("reconcile settles a funded send once chain evidence shows the claim", async () => {
+  const preimage = new Uint8Array(32).fill(9);
+  const paymentHash = sha256Hex(preimage);
+  const lockupTxid = "11".repeat(32);
   const { venue, store } = makeVenue({
-    now: () => NOW + 3601, // past the script's refundLocktime (NOW + 3600)
+    indexerProvider: spentLockupIndexer({
+      lockupTxid,
+      preimage,
+      revealed: true,
+    }),
     flows: {
-      requestLightningSend: async () => {
-        const response = sendResponse();
-        delete response.quote.refund_locktime;
-        return response;
-      },
-      readLockupFate: async () => ({ fate: "open" }),
-      refundIfUnresolved: async (_t, _a, _i, input) => {
-        refundInput = input;
-        return {
-          outcome: "refunded",
-          arkTxid: "fallback-refund",
-          amount: 1_050,
-          status: null,
-        };
-      },
+      requestLightningSend: async () =>
+        sendResponse({ quote: { profile: { payment_hash: paymentHash } } }),
+    },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", lockupTxid);
+  const report = await venue.reconcile();
+  assert.deepEqual(report.settled, ["rfq-1"]);
+  const record = await store.get("rfq-1");
+  assert.equal(record.phase, "settled");
+  assert.equal(record.resolvedTxid, "resolved-ark-tx");
+});
+
+test("reconcile refunds a matured send through the refundArkade flow", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3601,
+    flows: {
+      refundArkade: async () => ({ arkTxid: "refund-tx", amount: 1_050 }),
     },
   });
   await venue.prepareLightningSend({ invoice: {} });
   await venue.notifyFunded("rfq-1", "tx");
   const report = await venue.reconcile();
   assert.deepEqual(report.refunded, ["rfq-1"]);
-  assert.equal(report.errors.length, 0, "no eternal error loop");
-  assert.equal(refundInput.refundLocktime, NOW + 3600);
-  assert.equal((await store.get("rfq-1")).resolvedTxid, "fallback-refund");
+  const record = await store.get("rfq-1");
+  assert.equal(record.resolvedTxid, "refund-tx");
+});
+
+test("a matured send stays pending (unpushed) before its refund window opens", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 100, // funded, well before refund_locktime (NOW+3600)
+    flows: {
+      refundArkade: async () => {
+        throw new Error("must not be called before refund_locktime");
+      },
+    },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-1"]);
+  assert.equal((await store.get("rfq-1")).phase, "funded");
+});
+
+test("the solo refund of an empty (never actually funded) lockup reports cancelled, not refunded", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3601,
+    indexerProvider: fakeIndexer({ vtxos: [] }), // chain never saw the lockup
+    flows: { refundArkade: async () => null },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.cancelled, ["rfq-1"]);
+  assert.equal((await store.get("rfq-1")).resolvedTxid, undefined);
+});
+
+test("a swept lockup reports needs_recovery with its outpoints and keeps retrying", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3601, // within the MTP-lag grace window
+    flows: {
+      refundArkade: async () => {
+        throw new LockupNeedsRecoveryError(["deadbeef:0"], BigInt(NOW + 3600));
+      },
+    },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.needsRecovery, ["rfq-1"]);
+  assert.deepEqual((await store.get("rfq-1")).recoveryOutpoints, [
+    "deadbeef:0",
+  ]);
+});
+
+test("a refund that keeps failing past the MTP-lag deadline ends failed", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3600 + 2 * 60 * 60 + 1, // past refund_locktime + REFUND_MTP_LAG_SECONDS
+    flows: {
+      refundArkade: async () => {
+        throw new Error("server rejects: locktime not yet mature");
+      },
+    },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.failed, ["rfq-1"]);
+  const record = await store.get("rfq-1");
+  assert.equal(record.phase, "failed");
+  assert.ok(record.failureReason);
+});
+
+test("refundSend triggers an immediate pass without waiting for the next reconcile", async () => {
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3601,
+    flows: {
+      refundArkade: async () => ({ arkTxid: "direct-refund", amount: 1_050 }),
+    },
+  });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const record = await venue.refundSend("rfq-1");
+  assert.equal(record.phase, "refunded");
+  assert.equal((await store.get("rfq-1")).resolvedTxid, "direct-refund");
+});
+
+test("refundSend rejects for a receive-route record", async () => {
+  const { venue } = makeVenue();
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await assert.rejects(() => venue.refundSend("rfq-r1"), /not a send swap/);
+});
+
+// ─── funded receive: claim / settle / refund / needs_recovery ─────────────
+
+test("reconcile dispatches a claim once the lockup is funded", async () => {
+  let claimInput;
+  const { venue, store } = makeVenue({
+    flows: {
+      claimLockup: async (record, script, vtxos, options) => {
+        claimInput = { record, vtxos, options };
+        return { arkTxid: "claim-tx", amount: 1_000 };
+      },
+    },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  // Our own submission is recorded, but the swap is not `settled` until
+  // chain evidence confirms it — see the manager's own state-vs-fate split.
+  assert.deepEqual(report.pending, ["rfq-r1"]);
+  const record = await store.get("rfq-r1");
+  assert.equal(record.managerClaimArkTxid, "claim-tx");
+  assert.equal(claimInput.record.id, "rfq-r1");
+  assert.equal(claimInput.options.partiallyClaimed, false);
+  assert.ok(claimInput.vtxos.length > 0);
+});
+
+test("reconcile settles a receive once chain evidence confirms our claim", async () => {
+  const lockupTxid = "33".repeat(32);
+  const { venue, store } = makeVenue({
+    indexerProvider: spentLockupIndexer({
+      lockupTxid,
+      preimage: RECEIVE_PREIMAGE,
+      revealed: true,
+    }),
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.settled, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).phase, "settled");
+});
+
+test("a claim past the wait window leaves the receive pending, not failed", async () => {
+  const { venue, store } = makeVenue({
+    flows: {
+      claimLockup: async () => {
+        throw new Error("relay hiccup");
+      },
+    },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).phase, "funded");
+});
+
+test("a receive whose claim keeps failing past the deadline ends failed", async () => {
+  // The manager only remembers a claim failure it actually attempted, so the
+  // deadline has to be crossed AFTER at least one attempt inside the window
+  // — not simply reconciled once, already past it.
+  let now = NOW;
+  const { venue, store } = makeVenue({
+    now: () => now,
+    flows: {
+      claimLockup: async () => {
+        throw new Error("wallet cannot sign");
+      },
+    },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  let report = await venue.reconcile();
+  assert.deepEqual(report.pending, ["rfq-r1"]);
+  now = NOW + 3600 + 2 * 60 * 60 + 1;
+  report = await venue.reconcile();
+  assert.deepEqual(report.failed, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).phase, "failed");
+});
+
+test("a receive lockup swept before it could be claimed reports needs_recovery", async () => {
+  const { venue, store } = makeVenue({
+    flows: {
+      claimLockup: async () => {
+        throw new LockupNeedsRecoveryError(["swept:0"], BigInt(NOW + 3600));
+      },
+    },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.needsRecovery, ["rfq-r1"]);
+  assert.deepEqual((await store.get("rfq-r1")).recoveryOutpoints, ["swept:0"]);
+});
+
+test("a receive past the claim window with no chain trace at all is cancelled", async () => {
+  const { venue } = makeVenue({
+    now: () => NOW + 3600 + 2 * 60 * 60 + 1,
+    indexerProvider: fakeIndexer({ vtxos: [] }), // never funded
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.cancelled, ["rfq-r1"]);
+});
+
+test("a receive past the claim window that the solver reclaimed is refunded — a loss, not a cancel", async () => {
+  const lockupTxid = "44".repeat(32);
+  const { venue, store } = makeVenue({
+    now: () => NOW + 3600 + 2 * 60 * 60 + 1,
+    indexerProvider: spentLockupIndexer({
+      lockupTxid,
+      preimage: RECEIVE_PREIMAGE,
+      revealed: false, // the solver's own reclaim, not our claim
+    }),
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const report = await venue.reconcile();
+  assert.deepEqual(report.refunded, ["rfq-r1"]);
+  assert.equal((await store.get("rfq-r1")).resolvedTxid, "resolved-ark-tx");
+});
+
+test("claimReceive triggers a manager pass directly and returns the current record", async () => {
+  const { venue, store } = makeVenue({
+    flows: {
+      claimLockup: async () => ({ arkTxid: "direct-claim", amount: 1_000 }),
+    },
+  });
+  await venue.prepareLightningReceive({
+    amountSats: 1_000,
+    decodeInvoice: () => ({}),
+  });
+  await venue.notifyFunded("rfq-r1");
+  const record = await venue.claimReceive("rfq-r1", { waitSeconds: 0 });
+  assert.equal(record.managerClaimArkTxid, "direct-claim");
+  assert.equal((await store.get("rfq-r1")).managerClaimArkTxid, "direct-claim");
+});
+
+test("claimReceive rejects for a send-route record", async () => {
+  const { venue } = makeVenue();
+  await venue.prepareLightningSend({ invoice: {} });
+  await assert.rejects(() => venue.claimReceive("rfq-1"), /not a receive swap/);
+});
+
+// ─── reconcile concurrency ──────────────────────────────────────────────────
+
+test("concurrent reconcile calls share one pass", async () => {
+  let fateCalls = 0;
+  const slowIndexer = {
+    getVtxos: async (params) => {
+      if (!params?.recoverableOnly) {
+        fateCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return { vtxos: params?.recoverableOnly ? [] : [openVtxo()] };
+    },
+    getVirtualTxs: async () => ({ txs: [] }),
+  };
+  const { venue } = makeVenue({ indexerProvider: slowIndexer });
+  await venue.prepareLightningSend({ invoice: {} });
+  await venue.notifyFunded("rfq-1", "tx");
+  const [a, b] = await Promise.all([venue.reconcile(), venue.reconcile()]);
+  assert.equal(a, b, "second caller joins the running pass");
+  assert.equal(fateCalls, 1, "the lockup is read once per pass, not raced");
 });
 
 // ─── Asset-swap route ───────────────────────────────────────────────────────
@@ -528,7 +804,10 @@ function assetVenue({ flows = {}, indexer, now = () => NOW } = {}) {
     arkProvider: {
       getInfo: async () => ({ signerPubkey: "02" + "aa".repeat(32) }),
     },
-    indexerProvider: indexer ?? { getVtxos: async () => ({ vtxos: [] }) },
+    indexerProvider: indexer ?? {
+      getVtxos: async () => ({ vtxos: [] }),
+      getVirtualTxs: async () => ({ txs: [] }),
+    },
     now,
     flows: {
       createOffer: async () => ({
@@ -578,6 +857,7 @@ test("reconcile settles an asset swap whose deposit was filled", async () => {
           { txid: "fund-tx", vout: 0, spentBy: "fill-tx", isSpent: true },
         ],
       }),
+      getVirtualTxs: async () => ({ txs: [] }),
     },
     flows: { classifyAssetSwapSpend: async () => "fulfilled" },
   });
@@ -593,6 +873,7 @@ test("an unspent asset-swap deposit stays pending forever — no expiry", async 
   const { venue, repository } = assetVenue({
     indexer: {
       getVtxos: async () => ({ vtxos: [{ txid: "fund-tx", vout: 0 }] }),
+      getVirtualTxs: async () => ({ txs: [] }),
     },
     now: () => NOW + 10_000_000, // months later; offers never time out
   });
@@ -608,6 +889,7 @@ test("an unclassifiable spend is left alone, never guessed", async () => {
       getVtxos: async () => ({
         vtxos: [{ txid: "fund-tx", vout: 0, spentBy: "spend-tx" }],
       }),
+      getVirtualTxs: async () => ({ txs: [] }),
     },
     flows: { classifyAssetSwapSpend: async () => "indeterminate" },
   });
@@ -623,6 +905,7 @@ test("cancelAssetSwap losing the race to a fill reports fulfilled", async () => 
       getVtxos: async () => ({
         vtxos: [{ txid: "fund-tx", vout: 0, spentBy: "fill-tx" }],
       }),
+      getVirtualTxs: async () => ({ txs: [] }),
     },
     flows: {
       cancelOffer: async () => {
@@ -639,7 +922,10 @@ test("cancelAssetSwap losing the race to a fill reports fulfilled", async () => 
 
 test("cancelAssetSwap rethrows when the chain answers nothing", async () => {
   const { venue } = assetVenue({
-    indexer: { getVtxos: async () => ({ vtxos: [] }) },
+    indexer: {
+      getVtxos: async () => ({ vtxos: [] }),
+      getVirtualTxs: async () => ({ txs: [] }),
+    },
     flows: {
       cancelOffer: async () => {
         throw new Error("relay hiccup");

@@ -22,15 +22,25 @@
  * the Intents docs' rule: persist first, then move value. A store failure
  * throws while nothing is at stake.
  *
+ * ## Who drives the state machine
+ *
+ * `@arkade-os/swap` 0.0.4+ ships `RfqSwapManager`, which owns the
+ * phase/reconcile state machine this venue used to hand-roll (chain polling,
+ * claim/refund dispatch, terminal-state bookkeeping). This venue keeps that
+ * manager PRIVATE and drives it itself rather than exposing `start`/`stop`:
+ * the manager's own timer is a `setTimeout` loop, which does not survive an
+ * MV3 service worker being killed, so this venue only ever calls the
+ * manager's `addSwap()`/`poll()` — never `start()`/`stop()` — and the host's
+ * own scheduler (the same one that used to call `reconcile()` directly)
+ * keeps being the only timer in the system. See {@link ArkadeIntentsVenue.reconcile}.
+ *
  * ## Version coupling
  *
  * `@arkade-os/swap` hard-pins its own `@arkade-os/sdk`; the `wallet` object
  * crossing this boundary must come from that same SDK line. The peer ranges
- * encode it: `>=0.4.60 <0.5.0` for the SDK (0.4.60 introduced
- * `VHTLC.ScriptV2`; 0.5.x is uncharted and excluded on purpose) and
- * `^0.0.3` for `@arkade-os/swap` — which under 0.0.x semver rules resolves
- * to exactly 0.0.3, intentionally, while its API is pre-stability. The host
- * app owns the pins.
+ * encode it: `>=0.4.71 <0.5.0` for the SDK and `^0.0.14` for `@arkade-os/swap`
+ * — both pre-1.0, so the caret pins the exact minor/patch line this module
+ * was written against. The host app owns the pins.
  */
 
 import type { IWallet } from "@arkade-os/sdk";
@@ -41,36 +51,46 @@ import {
   Transaction,
   VHTLC,
   asset,
+  contractSigner,
 } from "@arkade-os/sdk";
 import type {
   AssetSwap,
   AssetSwapRepository,
+  AvailableRfqSwapManagerCallbacks,
   InvoiceFacts,
+  LightningReceiveSwap,
+  LightningSendSwap,
   LockupFate,
+  LockupSpendIndexer,
+  LockupVtxo,
   RefundArkProvider,
-  RefundIndexer,
   RfqQuote,
+  RfqSwap,
+  RfqSwapState,
   RfqTransport,
   SpendKind,
-  SwapSecrets,
+  SwapSecretsProjection,
 } from "@arkade-os/swap";
 import {
+  LockupNeedsRecoveryError,
+  PreimageNotRecoverableError,
+  RfqSwapManager,
   addAssetSwap,
   cancelOffer,
-  claimReceiveLockup,
   classifyDepositSpend,
   createOffer,
   decodeOffer,
+  findLockupVtxos,
   getAssetSwaps,
-  preimageForRfqSecrets,
+  preimageForSwapRecord,
+  pushClaim,
+  pushRefundWithoutReceiver,
   readLockupFate,
-  refundIfUnresolved,
   requestLightningReceive,
   requestLightningSend,
-  rfqSecretsOfRecord,
-  rfqSecretsToRecord,
-  senderIdentityForRfqSecrets,
+  senderIdentityForSwapRecord,
   spendTxidsOf,
+  swapSecretsToRecord,
   updateAssetSwap,
 } from "@arkade-os/swap";
 
@@ -83,14 +103,24 @@ export type ArkadeRoute =
  *
  * `prepared` — quoted and derived; nothing funded yet.
  * `funded` — the first enforceable commitment exists (send: lockup funded;
- *            receive: hold invoice reported paid by the caller).
+ *            receive: hold invoice reported paid by the caller) and the
+ *            underlying `RfqSwapManager` is driving it.
  * `settled` — evidence-terminal success (send: lockup claimed with the
  *            preimage; receive: we claimed the solver's lockup).
  * `refunded` — the commitment came back (timeout refund, or solver refund).
  * `cancelled` — nothing ever became enforceable (quote or invoice expired
- *            unfunded, or the claim window closed before funding).
+ *            unfunded, or the funded lockup was empty the whole time it was
+ *            observable).
  * `needs_recovery` — funds exist but the lockup's batch was swept; the
- *            wallet's VTXO recovery must run before a refund can be pushed.
+ *            wallet's VTXO recovery must run before a refund/claim can be
+ *            pushed. Informational only within one process's lifetime — the
+ *            manager keeps retrying automatically — but see
+ *            {@link ArkadeSwapStore.listPending}'s contract: a record left in
+ *            this phase is NOT re-attached to a fresh manager after a
+ *            restart, matching this phase's original (pre-manager) contract.
+ * `failed` — NEW: an action (refund push, claim push) kept failing until its
+ *            window closed. Has no pre-manager equivalent; see
+ *            {@link ArkadeSwapRecord.failureReason}.
  */
 export type ArkadeSwapPhase =
   | "prepared"
@@ -98,12 +128,36 @@ export type ArkadeSwapPhase =
   | "settled"
   | "refunded"
   | "cancelled"
-  | "needs_recovery";
+  | "needs_recovery"
+  | "failed";
 
 /** JSON-safe form of the SDK's `RelativeTimelock` (`bigint` → decimal string). */
 export interface SerializedRelativeTimelock {
   type: "blocks" | "seconds";
   value: string;
+}
+
+/**
+ * JSON-safe form of `VHTLC.Options.nonInteractiveParameters` — the emulator
+ * covenant suite, all-or-nothing.
+ */
+export interface SerializedNonInteractiveParameters {
+  emulatorPubkeyHex: string;
+  receiverPkScriptHex: string;
+  senderPkScriptHex: string;
+  /**
+   * `"preTimelockedRefund"` when this covenant was — or must be rebuilt as —
+   * the six-plus-two-leaf shape every lockup funded before the
+   * `nonInteractiveRefundWithoutReceiver` leaf shipped permanently carries.
+   * `"current"` for the full nine-leaf suite.
+   *
+   * ALWAYS written explicitly by {@link serializeVhtlcOptions}. That is what
+   * lets {@link deserializeVhtlcOptions} tell "no covenant suite" apart from
+   * "a covenant suite serialized before this field existed": the latter can
+   * only be the legacy shape, since it necessarily predates the leaf this
+   * field distinguishes. See that function for the decode rule.
+   */
+  legacy?: "preTimelockedRefund" | "current";
 }
 
 /**
@@ -120,14 +174,7 @@ export interface SerializedVhtlcOptions {
   unilateralClaimDelay: SerializedRelativeTimelock;
   unilateralRefundDelay: SerializedRelativeTimelock;
   unilateralRefundWithoutReceiverDelay: SerializedRelativeTimelock;
-  nonInteractiveClaim?: {
-    receiverPkScriptHex: string;
-    emulatorPubkeyHex: string;
-  };
-  nonInteractiveRefund?: {
-    senderPkScriptHex: string;
-    emulatorPubkeyHex: string;
-  };
+  nonInteractiveParameters?: SerializedNonInteractiveParameters;
 }
 
 /** The quote surface hosts show before asking the user to commit. */
@@ -167,8 +214,11 @@ export interface ArkadeSwapRecord {
   address: string;
   swapPkScriptHex: string;
   scriptOptions: SerializedVhtlcOptions;
-  /** `rfqSecretsToRecord` output — a public descriptor on HD wallets. */
-  secrets: ReturnType<typeof rfqSecretsToRecord>;
+  /** The wallet-provisioned secrets for this swap's own leg — the refund
+   * key on a send, the claim key (+ preimage material) on a receive. Public;
+   * the signer/preimage re-derive from the wallet. `swapSecretsToRecord`'s
+   * own output shape. */
+  secrets: SwapSecretsProjection & { signingDescriptor: string };
   /** Send-route fields. */
   fundAmountSats?: number;
   refundAddress?: string;
@@ -180,10 +230,25 @@ export interface ArkadeSwapRecord {
   payoutAddress?: string;
   /** Last moment the hold invoice can be paid, unix seconds. */
   invoiceExpiresAt?: number;
-  /** Terminal evidence: the Ark txid that settled or refunded the swap. */
+  /** Terminal evidence: the Ark txid that settled or refunded the swap
+   * (our own claim/refund push, or the counterparty's spend as observed on
+   * chain — in that preference order). */
   resolvedTxid?: string;
   /** Swept outpoints, when `phase === "needs_recovery"`. */
   recoveryOutpoints?: string[];
+  /** Why `phase === "failed"`. */
+  failureReason?: string;
+  /**
+   * `RfqSwapManager`'s own per-swap state, mirrored verbatim once this
+   * record has been handed to it. Absent while `phase === "prepared"`.
+   * Restored on `addSwap` so a process restart resumes with no lost
+   * evidence — see `ArkadeIntentsVenue`'s module doc.
+   */
+  managerState?: RfqSwapState;
+  managerRefundArkTxid?: string;
+  /** Receive-route only: our own submitted claim's txid. */
+  managerClaimArkTxid?: string;
+  managerLockupSpendArkTxids?: string[];
 }
 
 /** The persistence port. Implementations must write-through before resolving. */
@@ -221,6 +286,9 @@ export interface ReconcileReport {
   refunded: string[];
   cancelled: string[];
   needsRecovery: string[];
+  /** NEW: an action kept failing until its window closed. See
+   * {@link ArkadeSwapPhase}'s `failed` case. */
+  failed: string[];
   /** Still pending — nothing actionable this pass. */
   pending: string[];
   /** Records whose action threw; the record keeps its previous phase. */
@@ -234,9 +302,27 @@ export interface ReconcileReport {
 export interface ArkadeIntentsFlows {
   requestLightningSend: typeof requestLightningSend;
   requestLightningReceive: typeof requestLightningReceive;
-  claimReceiveLockup: typeof claimReceiveLockup;
-  refundIfUnresolved: typeof refundIfUnresolved;
+  /** Read the lockup's fate directly — used only by this venue's own
+   * pre-manager fast path for a still-`prepared` record past its window
+   * (see {@link ArkadeIntentsVenue.reconcile}). Once a record is `funded`,
+   * `RfqSwapManager` reads this on its own. */
   readLockupFate: typeof readLockupFate;
+  /** Claim a funded receive-route lockup. Defaults to resolving the
+   * record's receiver identity and preimage from the wallet and calling
+   * `pushClaim`. */
+  claimLockup: (
+    record: ArkadeSwapRecord,
+    script: InstanceType<typeof VHTLC.ScriptV2>,
+    vtxos: readonly LockupVtxo[],
+    options: { partiallyClaimed: boolean },
+  ) => Promise<{ arkTxid: string; amount: number }>;
+  /** Push the trader's own `refundWithoutReceiver` for a lockup. Defaults to
+   * resolving the record's sender identity from the wallet and calling
+   * `pushRefundWithoutReceiver`; resolves `null` for an empty lockup. */
+  refundArkade: (
+    record: ArkadeSwapRecord,
+    script: InstanceType<typeof VHTLC.ScriptV2>,
+  ) => Promise<{ arkTxid: string; amount: number } | null>;
   createOffer: typeof createOffer;
   cancelOffer: typeof cancelOffer;
   /** The deposit-spend classifier for asset-swap reconciliation: given the
@@ -262,7 +348,7 @@ export interface ArkadeIntentsVenueOptions {
   assetSwapRepository?: AssetSwapRepository;
   /** Defaults to REST providers on `arkServerUrl`. */
   arkProvider?: RefundArkProvider;
-  indexerProvider?: RefundIndexer & Parameters<typeof readLockupFate>[0];
+  indexerProvider?: LockupSpendIndexer;
   /** Unix seconds; injectable for tests. */
   now?: () => number;
   flows?: Partial<ArkadeIntentsFlows>;
@@ -331,6 +417,9 @@ const base64 = {
   },
 };
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 type VhtlcOptions = ConstructorParameters<typeof VHTLC.ScriptV2>[0];
 
 export function serializeVhtlcOptions(
@@ -342,6 +431,7 @@ export function serializeVhtlcOptions(
     type: t.type,
     value: t.value.toString(),
   });
+  const covenants = options.nonInteractiveParameters;
   return {
     senderHex: hex.encode(options.sender),
     receiverHex: hex.encode(options.receiver),
@@ -353,24 +443,17 @@ export function serializeVhtlcOptions(
     unilateralRefundWithoutReceiverDelay: timelock(
       options.unilateralRefundWithoutReceiverDelay,
     ),
-    ...(options.nonInteractiveClaim && {
-      nonInteractiveClaim: {
-        receiverPkScriptHex: hex.encode(
-          options.nonInteractiveClaim.receiverPkScript,
-        ),
-        emulatorPubkeyHex: hex.encode(
-          options.nonInteractiveClaim.emulatorPubkey,
-        ),
-      },
-    }),
-    ...(options.nonInteractiveRefund && {
-      nonInteractiveRefund: {
-        senderPkScriptHex: hex.encode(
-          options.nonInteractiveRefund.senderPkScript,
-        ),
-        emulatorPubkeyHex: hex.encode(
-          options.nonInteractiveRefund.emulatorPubkey,
-        ),
+    ...(covenants && {
+      nonInteractiveParameters: {
+        emulatorPubkeyHex: hex.encode(covenants.emulatorPubkey),
+        receiverPkScriptHex: hex.encode(covenants.receiverPkScript),
+        senderPkScriptHex: hex.encode(covenants.senderPkScript),
+        // Always explicit — see the field's own doc comment for why this is
+        // what makes a missing key at decode time unambiguous.
+        legacy:
+          covenants.legacy === "preTimelockedRefund"
+            ? ("preTimelockedRefund" as const)
+            : ("current" as const),
       },
     }),
   };
@@ -383,6 +466,33 @@ export function deserializeVhtlcOptions(
     type: t.type,
     value: BigInt(t.value),
   });
+  // A record from before this field existed used two separate objects
+  // (`nonInteractiveClaim` / `nonInteractiveRefund`) rather than one
+  // `nonInteractiveParameters` — the shape the pre-0.0.4 peer version of
+  // `@arkade-os/sdk` exposed. Best-effort migration: that shape can only ever
+  // have been the pre-timelocked-refund covenant, since it necessarily
+  // predates the leaf `legacy` distinguishes.
+  const legacyShape = s as unknown as {
+    nonInteractiveClaim?: {
+      receiverPkScriptHex: string;
+      emulatorPubkeyHex: string;
+    };
+    nonInteractiveRefund?: {
+      senderPkScriptHex: string;
+      emulatorPubkeyHex: string;
+    };
+  };
+  const covenants: SerializedNonInteractiveParameters | undefined =
+    s.nonInteractiveParameters ??
+    (legacyShape.nonInteractiveClaim && legacyShape.nonInteractiveRefund
+      ? {
+          emulatorPubkeyHex: legacyShape.nonInteractiveClaim.emulatorPubkeyHex,
+          receiverPkScriptHex:
+            legacyShape.nonInteractiveClaim.receiverPkScriptHex,
+          senderPkScriptHex: legacyShape.nonInteractiveRefund.senderPkScriptHex,
+          legacy: "preTimelockedRefund",
+        }
+      : undefined);
   return {
     sender: hex.decode(s.senderHex),
     receiver: hex.decode(s.receiverHex),
@@ -394,16 +504,19 @@ export function deserializeVhtlcOptions(
     unilateralRefundWithoutReceiverDelay: timelock(
       s.unilateralRefundWithoutReceiverDelay,
     ),
-    ...(s.nonInteractiveClaim && {
-      nonInteractiveClaim: {
-        receiverPkScript: hex.decode(s.nonInteractiveClaim.receiverPkScriptHex),
-        emulatorPubkey: hex.decode(s.nonInteractiveClaim.emulatorPubkeyHex),
-      },
-    }),
-    ...(s.nonInteractiveRefund && {
-      nonInteractiveRefund: {
-        senderPkScript: hex.decode(s.nonInteractiveRefund.senderPkScriptHex),
-        emulatorPubkey: hex.decode(s.nonInteractiveRefund.emulatorPubkeyHex),
+    ...(covenants && {
+      nonInteractiveParameters: {
+        emulatorPubkey: hex.decode(covenants.emulatorPubkeyHex),
+        receiverPkScript: hex.decode(covenants.receiverPkScriptHex),
+        senderPkScript: hex.decode(covenants.senderPkScriptHex),
+        // Never default to the current (fuller) shape for silently-missing
+        // data: a lockup already funded in the legacy shape recomputes a
+        // different taproot address under the current one, and that address
+        // would not be the one anyone sent to.
+        ...((covenants.legacy ?? "preTimelockedRefund") ===
+        "preTimelockedRefund"
+          ? { legacy: "preTimelockedRefund" as const }
+          : {}),
       },
     }),
   };
@@ -435,11 +548,22 @@ export class ArkadeIntentsVenue {
   private readonly transport: RfqTransport;
   private readonly store: ArkadeSwapStore;
   private readonly ark: RefundArkProvider;
-  private readonly indexer: RefundIndexer &
-    Parameters<typeof readLockupFate>[0];
+  private readonly indexer: LockupSpendIndexer;
   private readonly now: () => number;
   private readonly flows: ArkadeIntentsFlows;
   private readonly assetSwaps?: AssetSwapRepository;
+
+  /** The state machine. Never `start()`/`stop()`-ed — see the module doc:
+   * this venue owns no timer, and drives the manager itself via
+   * `addSwap()`/`poll()` from {@link reconcile}, exactly like the host's own
+   * scheduler used to drive the old hand-rolled reconcile loop. */
+  private readonly manager: RfqSwapManager;
+  /** rfqId → outpoints from the most recent `LockupNeedsRecoveryError` this
+   * process observed for that swap. Informational: it drives this venue's
+   * own `needs_recovery` phase label; the manager itself keeps retrying
+   * regardless. Cleared once the swap reaches a state that is not one of
+   * this label's own precondition (see {@link phaseOf}). */
+  private readonly recoveryOutpoints = new Map<string, string[]>();
 
   constructor(options: ArkadeIntentsVenueOptions) {
     this.wallet = options.wallet;
@@ -454,15 +578,40 @@ export class ArkadeIntentsVenue {
     this.flows = {
       requestLightningSend,
       requestLightningReceive,
-      claimReceiveLockup,
-      refundIfUnresolved,
       readLockupFate,
+      claimLockup: (record, script, vtxos, claimOptions) =>
+        this.defaultClaimLockup(record, script, vtxos, claimOptions),
+      refundArkade: (record, script) =>
+        this.defaultRefundArkade(record, script),
       createOffer,
       cancelOffer,
       classifyAssetSwapSpend: (swap, deposit) =>
         this.fetchAndClassifySpend(swap, deposit),
       ...options.flows,
     };
+
+    this.manager = new RfqSwapManager(
+      { indexer: this.indexer },
+      { enableAutoActions: true, now: this.now },
+    );
+    const callbacks: AvailableRfqSwapManagerCallbacks = {
+      claimLockup: (swap, vtxos, claimOptions) =>
+        this.dispatchClaimLockup(swap, vtxos, claimOptions),
+      refundArkade: (swap) => this.dispatchRefundArkade(swap),
+      saveSwap: (swap) => this.managerSaveSwap(swap),
+    };
+    this.manager.setCallbacks(callbacks);
+    this.manager.onSwapFailed((swap, error) => {
+      if (swap.kind === "onchain_send") return; // never added by this venue
+      if (error instanceof LockupNeedsRecoveryError) {
+        this.recoveryOutpoints.set(swap.rfqId, [...error.outpoints]);
+        // The manager may not have marked this swap dirty for a caught-and-
+        // retried failure (see the module doc on `ReconcileReport.errors`),
+        // so this label would otherwise lag until the swap's state next
+        // changes for an unrelated reason. Force the write.
+        void this.managerSaveSwap(swap).catch(() => {});
+      }
+    });
   }
 
   /**
@@ -491,7 +640,7 @@ export class ArkadeIntentsVenue {
       address: send.address,
       swapPkScriptHex: hex.encode(send.swapPkScript),
       scriptOptions: serializeVhtlcOptions(send.script.options),
-      secrets: rfqSecretsToRecord(send.secrets),
+      secrets: swapSecretsToRecord(send.secrets),
       fundAmountSats: send.fundAmount,
       refundAddress: send.refundAddress,
     };
@@ -516,8 +665,8 @@ export class ArkadeIntentsVenue {
     /** `"to"` = amount received on Arkade (default); `"from"` = amount paid. */
     amountSide?: "from" | "to";
     /** covclaimd's compressed pubkey; enables offline claim via the solver's
-     * claim daemon. Required by the underlying flow. */
-    covclaimdPubkey: Uint8Array;
+     * claim daemon. Optional — unset where no covclaimd is deployed. */
+    covclaimdPubkey?: Uint8Array;
     /** The host's own BOLT11 decoder, applied to the SOLVER's invoice. */
     decodeInvoice: (bolt11: string) => InvoiceFacts;
     maxPayAmountSats?: number;
@@ -545,7 +694,7 @@ export class ArkadeIntentsVenue {
       address: receive.address,
       swapPkScriptHex: hex.encode(receive.swapPkScript),
       scriptOptions: serializeVhtlcOptions(receive.script.options),
-      secrets: rfqSecretsToRecord(receive.secrets),
+      secrets: swapSecretsToRecord(receive.secrets),
       invoice: receive.invoice,
       payAmountSats: receive.payAmount,
       expectedAmountSats: receive.expectedAmount,
@@ -565,6 +714,7 @@ export class ArkadeIntentsVenue {
   /**
    * Record the caller's commitment: the send-lockup funding txid, or (for
    * receives, txid omitted) that the hold-invoice payment was dispatched.
+   * Hands the swap to the internal `RfqSwapManager` from here on.
    *
    * Only `prepared` records advance (repeating on an already-`funded`
    * record is a harmless idempotent retry); a terminal record refuses —
@@ -583,14 +733,17 @@ export class ArkadeIntentsVenue {
     record.phase = "funded";
     if (fundingTxid !== undefined) record.fundingTxid = fundingTxid;
     await this.store.put(record);
+    await this.ensureTracked(record);
     return record;
   }
 
   /**
    * Claim a receive-route lockup, revealing the preimage — the step that
-   * completes the swap. Waits up to `waitSeconds` (default 10) for the
-   * solver's funding to appear before giving up for this pass; the claim
-   * itself is bounded by the quote's `refund_locktime`.
+   * completes the swap. Triggers manager passes for up to `waitSeconds`
+   * (default 10, wall-clock) waiting for the solver's funding to appear and
+   * the claim to land; the claim itself remains bounded by the quote's
+   * `refund_locktime`, enforced by the manager on every pass regardless of
+   * this call.
    */
   async claimReceive(
     id: string,
@@ -601,103 +754,33 @@ export class ArkadeIntentsVenue {
       throw new Error(`claimReceive: ${id} is not a receive swap`);
     }
     if (record.phase === "settled") return record;
-    const secrets = this.secretsOf(record);
-    const script = new VHTLC.ScriptV2(
-      deserializeVhtlcOptions(record.scriptOptions),
-    );
-    const deadline = Math.min(
-      record.quote.refund_locktime ?? Number.POSITIVE_INFINITY,
-      this.now() + (options?.waitSeconds ?? 10),
-    );
-    const { arkTxid } = await this.flows.claimReceiveLockup(
-      this.indexer,
-      this.ark,
-      {
-        swapPkScript: hex.decode(record.swapPkScriptHex),
-        // Required by the type but ignored by the implementation, which waits
-        // for the funding and substitutes what it finds.
-        vtxos: [],
-        script,
-        receiver: await senderIdentityForRfqSecrets(this.wallet, secrets),
-        preimage: await preimageForRfqSecrets(this.wallet, secrets),
-        destinationPkScript: ArkAddress.decode(this.payoutAddressOf(record))
-          .pkScript,
-        expectedAmount: this.expectedAmountOf(record),
-        deadline,
-      },
-    );
-    record.phase = "settled";
-    record.resolvedTxid = arkTxid;
-    await this.store.put(record);
-    return record;
+    await this.ensureTracked(record);
+    const waitMs = Math.max(0, options?.waitSeconds ?? 10) * 1000;
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      await this.manager.poll();
+      const updated = await this.mustGet(id);
+      if (updated.phase !== "funded") return updated;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return updated;
+      await sleep(Math.min(250, remaining));
+    }
   }
 
   /**
-   * Resolve a stalled send: returns as soon as the solver settled or
-   * refunded, otherwise pushes the trader's `refundWithoutReceiver` once
-   * `refund_locktime` has matured. Safe to call repeatedly and late.
+   * Resolve a stalled send: triggers a manager pass, which settles as soon
+   * as the solver claims or refunds, and otherwise pushes the trader's
+   * `refundWithoutReceiver` once `refund_locktime` has matured. Safe to call
+   * repeatedly and late.
    */
   async refundSend(id: string): Promise<ArkadeSwapRecord> {
     const record = await this.mustGet(id);
     if (record.route !== "arkade:BTC->lightning:BTC") {
       throw new Error(`refundSend: ${id} is not a send swap`);
     }
-    const secrets = this.secretsOf(record);
-    const script = new VHTLC.ScriptV2(
-      deserializeVhtlcOptions(record.scriptOptions),
-    );
-    const outcome = await this.flows.refundIfUnresolved(
-      this.transport,
-      this.ark,
-      this.indexer,
-      {
-        rfqId: record.id,
-        script,
-        sender: await senderIdentityForRfqSecrets(this.wallet, secrets),
-        refundLocktime: this.refundLocktimeOf(record),
-        now: this.now,
-      },
-    );
-    switch (outcome.outcome) {
-      case "resolved": {
-        record.phase =
-          outcome.status.state === "refunded" ? "refunded" : "settled";
-        // The solver's terminal receipt may name the settling transaction;
-        // best-effort, since the profile shape is solver-defined.
-        const txid = outcome.status.profile?.txid;
-        if (typeof txid === "string") record.resolvedTxid = txid;
-        break;
-      }
-      case "refunded":
-        record.phase = "refunded";
-        record.resolvedTxid = outcome.arkTxid;
-        break;
-      case "nothing_to_refund": {
-        // The lockup is empty. Chain evidence — never the local record —
-        // says which way it went: a preimage-revealing spend is the solver
-        // completing (invoice paid), any other spend returned the funds,
-        // and a lockup that never saw an output means the quote simply
-        // lapsed. `fundingTxid` is NOT consulted: `notifyFunded(id)` may
-        // legitimately have recorded no txid, and the host may have
-        // funded and crashed before calling it at all.
-        const fate = await this.fateOf(record);
-        record.phase =
-          fate.fate === "claimed"
-            ? "settled"
-            : fate.fate === "returned"
-              ? "refunded"
-              : fate.fate === "unknown"
-                ? "cancelled"
-                : record.phase; // "open" contradicts nothing_to_refund; re-read next pass
-        break;
-      }
-      case "needs_recovery":
-        record.phase = "needs_recovery";
-        record.recoveryOutpoints = outcome.outpoints;
-        break;
-    }
-    await this.store.put(record);
-    return record;
+    await this.ensureTracked(record);
+    await this.manager.poll();
+    return this.mustGet(id);
   }
 
   /** In-flight reconcile pass; a second caller joins it instead of racing. */
@@ -707,11 +790,20 @@ export class ArkadeIntentsVenue {
    * One evidence-driven pass over every pending record. Never throws for a
    * single record's failure — errors are reported and the record keeps its
    * phase for the next pass. Designed to be called from a host alarm/timer;
-   * a relay timeout inside any step means "unknown", not "failed".
+   * this venue owns no timer of its own, and neither does the underlying
+   * `RfqSwapManager` from this venue's point of view — it is driven purely
+   * through `addSwap()`/`poll()` here, never `start()`/`stop()`.
    *
-   * Re-entrant calls share the running pass: a pass can spend seconds
-   * waiting on a claim, and a host alarm firing meanwhile must not run a
+   * Re-entrant calls share the running pass: a pass can spend time waiting
+   * on network reads, and a host alarm firing meanwhile must not run a
    * second pass over the same records.
+   *
+   * A `prepared` record past its commitment window is checked directly
+   * against chain evidence (not yet handed to the manager, since the
+   * manager has no notion of "quoted but maybe never funded"): a lockup the
+   * indexer has never seen is `cancelled`; any other evidence means the
+   * caller's `notifyFunded` call was lost (crash between broadcast and
+   * notify) and the record self-heals to `funded` and is handed off.
    */
   reconcile(): Promise<ReconcileReport> {
     if (this.reconcilePass) return this.reconcilePass;
@@ -727,134 +819,279 @@ export class ArkadeIntentsVenue {
       refunded: [],
       cancelled: [],
       needsRecovery: [],
+      failed: [],
       pending: [],
       errors: [],
     };
-    const file = (record: ArkadeSwapRecord) => {
-      switch (record.phase) {
-        case "settled":
-          report.settled.push(record.id);
-          break;
-        case "refunded":
-          report.refunded.push(record.id);
-          break;
-        case "cancelled":
-          report.cancelled.push(record.id);
-          break;
-        case "needs_recovery":
-          report.needsRecovery.push(record.id);
-          break;
-        default:
-          report.pending.push(record.id);
-      }
-    };
+    const touched: string[] = [];
     for (const record of await this.store.listPending()) {
       try {
-        file(
-          record.route === "arkade:BTC->lightning:BTC"
-            ? await this.reconcileSend(record)
-            : await this.reconcileReceive(record),
-        );
+        if (record.phase === "prepared") {
+          const after = await this.reconcilePreparedRecord(record);
+          if (after.phase !== "funded") {
+            this.file(report, after);
+            continue;
+          }
+          touched.push(after.id);
+          continue;
+        }
+        await this.ensureTracked(record);
+        touched.push(record.id);
       } catch (error) {
         report.errors.push({ id: record.id, error });
       }
+    }
+    await this.manager.poll();
+    for (const id of touched) {
+      const record = await this.store.get(id);
+      if (record) this.file(report, record);
     }
     if (this.assetSwaps) await this.reconcileAssetSwaps(report);
     return report;
   }
 
-  private async reconcileSend(
+  private file(report: ReconcileReport, record: ArkadeSwapRecord): void {
+    switch (record.phase) {
+      case "settled":
+        report.settled.push(record.id);
+        break;
+      case "refunded":
+        report.refunded.push(record.id);
+        break;
+      case "cancelled":
+        report.cancelled.push(record.id);
+        break;
+      case "needs_recovery":
+        report.needsRecovery.push(record.id);
+        break;
+      case "failed":
+        report.failed.push(record.id);
+        break;
+      default:
+        report.pending.push(record.id);
+    }
+  }
+
+  /**
+   * The pre-manager fast path for a `prepared` record past its window.
+   * Chain evidence — never the local flag — decides which way it went: the
+   * host may have broadcast the lockup (or dispatched the LN payment) and
+   * died before calling `notifyFunded`.
+   */
+  private async reconcilePreparedRecord(
     record: ArkadeSwapRecord,
   ): Promise<ArkadeSwapRecord> {
-    if (record.phase === "prepared" && this.now() < record.quote.valid_until) {
-      // Inside the commitment window with no funding reported: nothing to
-      // do yet, and no reason to poll the chain every pass.
-      return record;
-    }
-    // Everything else is decided from chain evidence first. In particular a
-    // `prepared` record past `valid_until` is NOT cancelled on the local
-    // flag alone: funding is acceptance, so the host may have broadcast the
-    // lockup and died before `notifyFunded` — a record dropped from the
-    // pending set here would strand real sats in a VHTLC whose derivation
-    // only this record holds.
-    const fate = await this.fateOf(record);
-    if (fate.fate === "claimed") {
-      record.phase = "settled";
-      await this.store.put(record);
-      return record;
-    }
-    if (fate.fate === "returned") {
-      record.phase = "refunded";
-      await this.store.put(record);
+    const deadline =
+      record.route === "arkade:BTC->lightning:BTC"
+        ? record.quote.valid_until
+        : (record.invoiceExpiresAt ?? record.quote.valid_until);
+    if (this.now() < deadline) return record;
+
+    let fate: LockupFate;
+    try {
+      fate = await this.flows.readLockupFate(this.indexer, {
+        swapPkScript: hex.decode(record.swapPkScriptHex),
+        paymentHash: this.paymentHashOf(record),
+      });
+    } catch {
+      // Transient: try again next pass rather than guessing.
       return record;
     }
     if (fate.fate === "unknown") {
-      if (record.phase === "prepared") {
-        // Past the window and the chain has never seen the lockup: the
-        // negotiation is dead and nothing was ever at stake.
-        record.phase = "cancelled";
-        await this.store.put(record);
-      }
-      // `funded` + no chain trace: the funding may still be propagating —
-      // keep watching rather than invent a terminal state.
+      record.phase = "cancelled";
+      await this.store.put(record);
       return record;
     }
-    // The lockup is live. A prepared record self-heals to funded (the
-    // crash-between-broadcast-and-notify case), and a matured one refunds.
-    if (record.phase === "prepared") {
-      record.phase = "funded";
-      await this.store.put(record);
-    }
-    if (this.now() >= this.refundLocktimeOf(record)) {
-      return this.refundSend(record.id);
-    }
+    // Something is there: the swap secretly got funded. Hand it to the
+    // manager from here on — the caller's own reconcile loop (this method's
+    // own caller) tracks and polls it the same pass.
+    record.phase = "funded";
+    await this.store.put(record);
     return record;
   }
 
-  private async reconcileReceive(
+  private async ensureTracked(record: ArkadeSwapRecord): Promise<void> {
+    if (await this.manager.hasSwap(record.id)) return;
+    await this.manager.addSwap(this.liveSwapFromRecord(record));
+  }
+
+  /** Rebuild the manager's live swap object from our own persisted record —
+   * the composition the manager's own doc recommends for a consumer keeping
+   * its own store rather than wiring `RfqSwapManagerDeps.repository`. */
+  private liveSwapFromRecord(
     record: ArkadeSwapRecord,
-  ): Promise<ArkadeSwapRecord> {
-    const deadline = record.quote.refund_locktime;
-    if (record.phase === "prepared") {
-      // The invoice was never reported paid. Once it can no longer be paid,
-      // nothing can arm the swap.
-      const expiry = record.invoiceExpiresAt ?? record.quote.valid_until;
-      if (this.now() >= expiry) {
-        record.phase = "cancelled";
-        await this.store.put(record);
+  ): LightningSendSwap | LightningReceiveSwap {
+    const script = new VHTLC.ScriptV2(
+      deserializeVhtlcOptions(record.scriptOptions),
+    );
+    const common = {
+      rfqId: record.id,
+      state: record.managerState ?? ("pending" as RfqSwapState),
+      lockupPkScript: hex.decode(record.swapPkScriptHex),
+      lockup: { script, address: record.address },
+      paymentHash: this.paymentHashOf(record),
+      refundLocktime: this.refundLocktimeOf(record),
+      createdAt: record.createdAt,
+      updatedAt: record.createdAt,
+      ...(record.managerRefundArkTxid
+        ? { refundArkTxid: record.managerRefundArkTxid }
+        : {}),
+      ...(record.managerLockupSpendArkTxids?.length
+        ? { lockupSpendArkTxids: [...record.managerLockupSpendArkTxids] }
+        : {}),
+      ...(record.failureReason ? { failure: record.failureReason } : {}),
+    };
+    if (record.route === "arkade:BTC->lightning:BTC") {
+      return { ...common, kind: "lightning_send" };
+    }
+    return {
+      ...common,
+      kind: "lightning_receive",
+      expectedAmount: this.expectedAmountOf(record),
+      ...(record.managerClaimArkTxid
+        ? { claimArkTxid: record.managerClaimArkTxid }
+        : {}),
+    };
+  }
+
+  /**
+   * `RfqSwapManagerCallbacks.saveSwap` — translate the manager's live state
+   * back into this venue's own persisted phase and write it through.
+   */
+  private async managerSaveSwap(swap: RfqSwap): Promise<void> {
+    if (swap.kind === "onchain_send") {
+      // Never reachable: this venue never calls `addSwap` with this kind.
+      throw new Error("ArkadeIntentsVenue never monitors onchain-send swaps");
+    }
+    const record = await this.mustGet(swap.rfqId);
+    record.managerState = swap.state;
+    record.managerRefundArkTxid = swap.refundArkTxid;
+    if (swap.kind === "lightning_receive") {
+      record.managerClaimArkTxid = swap.claimArkTxid;
+    }
+    record.managerLockupSpendArkTxids = swap.lockupSpendArkTxids
+      ? [...swap.lockupSpendArkTxids]
+      : undefined;
+    record.failureReason = swap.failure;
+
+    const recovery = this.recoveryOutpoints.get(swap.rfqId);
+    record.phase = this.phaseOf(swap, recovery);
+    if (record.phase === "needs_recovery" && recovery) {
+      record.recoveryOutpoints = recovery;
+    } else {
+      this.recoveryOutpoints.delete(swap.rfqId);
+    }
+
+    const terminalTxid =
+      swap.kind === "lightning_receive"
+        ? ((swap.state === "refunded"
+            ? swap.refundArkTxid
+            : swap.claimArkTxid) ?? swap.lockupSpendArkTxids?.[0])
+        : (swap.refundArkTxid ?? swap.lockupSpendArkTxids?.[0]);
+    if (terminalTxid) record.resolvedTxid = terminalTxid;
+
+    await this.store.put(record);
+  }
+
+  /**
+   * The manager's `RfqSwapState` projected onto this venue's own phase
+   * vocabulary.
+   *
+   * `refunded` with NO txid evidence anywhere (neither our own push nor a
+   * chain-observed spend) means the lockup was never funded at all — the
+   * manager settles for `refunded` there too (see `RfqSwapManager`'s own
+   * doc, "the ONE place the manager settles for less than proof"), but this
+   * venue's older vocabulary calls that `cancelled` instead, since nothing
+   * was ever at stake.
+   */
+  private phaseOf(
+    swap: LightningSendSwap | LightningReceiveSwap,
+    recovery: string[] | undefined,
+  ): ArkadeSwapPhase {
+    switch (swap.state) {
+      case "settled":
+        return "settled";
+      case "refunded": {
+        const hasEvidence =
+          Boolean(swap.refundArkTxid) ||
+          Boolean(swap.lockupSpendArkTxids?.length) ||
+          (swap.kind === "lightning_receive" && Boolean(swap.claimArkTxid));
+        return hasEvidence ? "refunded" : "cancelled";
       }
-      return record;
+      case "failed":
+        return "failed";
+      default:
+        return recovery ? "needs_recovery" : "funded";
     }
-    // Payment dispatched: claim as soon as the solver's lockup appears. Past
-    // the solver's refund horizon the claim window is closed — claiming
-    // would publish the preimage into a refund race — but the record is NOT
-    // cancelled on the clock alone: `covclaimdPubkey` exists precisely so
-    // the solver's claim daemon can claim for us while we were offline, and
-    // that claim settled the swap.
-    if (deadline !== undefined && this.now() >= deadline) {
-      const fate = await this.fateOf(record);
-      if (fate.fate === "claimed") {
-        record.phase = "settled";
-      } else if (fate.fate === "returned") {
-        // The solver reclaimed its lockup; our LN payment fails back.
-        record.phase = "refunded";
-      } else if (fate.fate === "unknown") {
-        // Never funded and no longer claimable.
-        record.phase = "cancelled";
-      } else {
-        // Still open past the deadline: the solver's to resolve — claiming
-        // now would race its refund. Keep watching.
-        return record;
-      }
-      await this.store.put(record);
-      return record;
+  }
+
+  /** `RfqSwapManagerCallbacks.claimLockup`, dispatched to the flow seam. */
+  private async dispatchClaimLockup(
+    swap: LightningReceiveSwap,
+    vtxos: readonly LockupVtxo[],
+    options: { partiallyClaimed: boolean },
+  ): Promise<{ arkTxid: string; amount: number }> {
+    const record = await this.mustGet(swap.rfqId);
+    const script =
+      swap.lockup?.script ??
+      new VHTLC.ScriptV2(deserializeVhtlcOptions(record.scriptOptions));
+    return this.flows.claimLockup(record, script, vtxos, options);
+  }
+
+  /** `RfqSwapManagerCallbacks.refundArkade`, dispatched to the flow seam. */
+  private async dispatchRefundArkade(
+    swap: RfqSwap,
+  ): Promise<{ arkTxid: string; amount: number } | null> {
+    if (swap.kind === "onchain_send") {
+      throw new Error("onchain-send swaps are not supported by this venue");
     }
-    try {
-      return await this.claimReceive(record.id, { waitSeconds: 5 });
-    } catch {
-      // Not funded yet (or a transient push failure): unknown, not failed.
-      return record;
-    }
+    const record = await this.mustGet(swap.rfqId);
+    const script =
+      swap.lockup?.script ??
+      new VHTLC.ScriptV2(deserializeVhtlcOptions(record.scriptOptions));
+    return this.flows.refundArkade(record, script);
+  }
+
+  private async defaultClaimLockup(
+    record: ArkadeSwapRecord,
+    script: InstanceType<typeof VHTLC.ScriptV2>,
+    vtxos: readonly LockupVtxo[],
+    options: { partiallyClaimed: boolean },
+  ): Promise<{ arkTxid: string; amount: number }> {
+    const receiver = await contractSigner(
+      this.wallet,
+      this.requireSigningDescriptor(record),
+    );
+    const preimage = await preimageForSwapRecord(this.wallet, {
+      ...record.secrets,
+      paymentHash: this.paymentHashOf(record),
+    });
+    return pushClaim(this.ark, {
+      script,
+      receiver,
+      preimage,
+      vtxos,
+      destinationPkScript: ArkAddress.decode(this.payoutAddressOf(record))
+        .pkScript,
+      expectedAmount: this.expectedAmountOf(record),
+      partiallyClaimed: options.partiallyClaimed,
+    });
+  }
+
+  private async defaultRefundArkade(
+    record: ArkadeSwapRecord,
+    script: InstanceType<typeof VHTLC.ScriptV2>,
+  ): Promise<{ arkTxid: string; amount: number } | null> {
+    const vtxos = await findLockupVtxos(
+      this.indexer,
+      hex.decode(record.swapPkScriptHex),
+    );
+    if (vtxos.length === 0) return null;
+    const sender = await senderIdentityForSwapRecord(
+      this.wallet,
+      record.secrets,
+    );
+    return pushRefundWithoutReceiver(this.ark, { script, sender, vtxos });
   }
 
   private async mustGet(id: string): Promise<ArkadeSwapRecord> {
@@ -863,11 +1100,14 @@ export class ArkadeIntentsVenue {
     return record;
   }
 
-  private secretsOf(record: ArkadeSwapRecord): SwapSecrets {
-    const secrets = rfqSecretsOfRecord(record.secrets);
-    if (!secrets)
-      throw new Error(`swap ${record.id}: secrets record is unusable`);
-    return secrets;
+  private requireSigningDescriptor(record: ArkadeSwapRecord): string {
+    if (!record.secrets.signingDescriptor) {
+      throw new PreimageNotRecoverableError(
+        "no-secrets",
+        `swap ${record.id}: no signing descriptor on record`,
+      );
+    }
+    return record.secrets.signingDescriptor;
   }
 
   private refundLocktimeOf(record: ArkadeSwapRecord): number {
@@ -894,15 +1134,12 @@ export class ArkadeIntentsVenue {
     return record.expectedAmountSats;
   }
 
-  private async fateOf(record: ArkadeSwapRecord): Promise<LockupFate> {
-    const paymentHash = record.quote.profile.payment_hash;
+  private paymentHashOf(record: ArkadeSwapRecord): string {
+    const paymentHash = record.quote.profile?.payment_hash;
     if (typeof paymentHash !== "string") {
       throw new Error(`swap ${record.id}: quote profile has no payment_hash`);
     }
-    return this.flows.readLockupFate(this.indexer, {
-      swapPkScript: hex.decode(record.swapPkScriptHex),
-      paymentHash,
-    });
+    return paymentHash;
   }
 
   // ─── Intra-Arkade asset swaps ────────────────────────────────────────────
