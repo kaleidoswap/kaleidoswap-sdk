@@ -121,11 +121,11 @@ key with allowed origins and per-key rate limits is a separate, later concept.
 
 | Surface | Install | Supported runtime |
 |---|---|---|
-| Rust | `kaleidorg-swap-sdk = { git = "https://github.com/kaleidoswap/swap-sdk", tag = "v0.5.0" }` | Rust 1.88+, native and `wasm32-unknown-unknown` |
+| Rust | `kaleidorg-swap-sdk = { git = "https://github.com/kaleidoswap/swap-sdk", tag = "v0.6.0" }` | Rust 1.88+, native and `wasm32-unknown-unknown` |
 | Python | `pip install kaleidorg_swap_sdk` | Python 3.10+; wheels for Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64, sdist elsewhere |
 | TypeScript | `npm install @kaleidorg/swap-sdk` | Browsers and Node 22+; `await init()` takes no argument in either |
 
-Both registries are live and carry every release through `0.5.0`:
+Both registries are live and carry every release through `0.6.0`:
 `kaleidorg_swap_sdk` on PyPI (five platform wheels plus an sdist) and
 `@kaleidorg/swap-sdk` on npm. npm has no `0.1.0` — that version reached PyPI
 only; see the `0.1.1` changelog entry. The Rust crate is not published to
