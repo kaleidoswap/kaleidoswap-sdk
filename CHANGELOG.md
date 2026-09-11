@@ -59,6 +59,47 @@ let pair = pairs.get_lusdt_to_btc_pair();
 maker serves exactly one currency there, so nothing is being dropped, and
 changing it would break callers for no gain.
 
+### Breaking — Arkade swap phases gained a `failed` state
+
+`@arkade-os/swap` moves from `^0.0.3` to `^0.0.14` (`@arkade-os/sdk`
+`>=0.4.71 <0.5.0`), and `ArkadeIntentsVenue` now wraps that line's own
+`RfqSwapManager` instead of hand-rolling the same phase/reconcile state machine
+— chain polling, claim and refund dispatch, terminal-state bookkeeping.
+
+`ArkadeSwapPhase` and `ReconcileReport` each gain a `"failed"` value: an action
+that kept failing until its window closed, which the previous hand-rolled loop
+had no equivalent for. The addition is additive to the type, but a downstream
+exhaustive `switch` over either needs a new arm.
+
+The manager is kept private and driven only through `addSwap()` / `poll()`,
+never `start()` / `stop()`. Its own timer is a `setTimeout` loop that would not
+survive an MV3 service worker being killed, so the host's scheduler — the one
+already calling `reconcile()` — stays the only timer in the system.
+
+The `ArkadeSwapStore` / `ArkadeSwapRecord` persistence contract is preserved;
+only additive fields were introduced, so an existing store implementation keeps
+working unmodified. `VHTLC.ScriptV2` gained a third covenant leaf in this SDK
+line, and a serialized record carrying no `legacy` marker decodes as the
+pre-existing eight-leaf shape rather than the new nine-leaf one — an
+already-funded lockup keeps rebuilding the address it was actually funded at
+instead of drifting to a different one.
+
+Not yet exercised against a live solver on signet.
+
+### Fixed — a claim address for the wrong network was accepted
+
+`BtcSwapTx::new_claim_with_utxo` called `is_valid_for_network` and discarded
+the result before `assume_checked()`, so a claim address belonging to a
+different network passed validation silently. `new_refund` already guarded this
+correctly; the claim path now matches it and returns `Error::Address` instead.
+
+### Fixed — a pending cooperative claim no longer breaks the chain status stream
+
+`ChainSwapStates` was missing `TransactionClaimPending`
+(`transaction.claim.pending`), which the server can emit for taproot
+cooperative-claim chain swaps. Receiving it failed status-stream
+deserialization outright; the variant now exists.
+
 ## [0.5.0] - 2026-09-08
 
 ### Fixed — `Error` implements `std::error::Error`
