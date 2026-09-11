@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.6.0] - 2026-09-10
+## [0.6.0] - 2026-09-11
 
 ### Breaking — pair maps keep every currency the server sends
 
