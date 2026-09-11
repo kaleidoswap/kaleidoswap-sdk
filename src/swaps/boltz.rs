@@ -2667,6 +2667,9 @@ pub enum ChainSwapStates {
     /// The lockup transaction of the server has been included in a block.
     #[serde(rename = "transaction.server.confirmed")]
     TransactionServerConfirmed,
+    /// A cooperative taproot claim transaction has been broadcast but is not yet confirmed.
+    #[serde(rename = "transaction.claim.pending")]
+    TransactionClaimPending,
     /// The server claimed the coins that the client locked.
     #[serde(rename = "transaction.claimed")]
     TransactionClaimed,
@@ -2701,6 +2704,7 @@ impl Display for ChainSwapStates {
             ChainSwapStates::TransactionServerConfirmed => {
                 "transaction.server.confirmed".to_string()
             }
+            ChainSwapStates::TransactionClaimPending => "transaction.claim.pending".to_string(),
             ChainSwapStates::TransactionClaimed => "transaction.claimed".to_string(),
             ChainSwapStates::TransactionLockupFailed => "transaction.lockupFailed".to_string(),
             ChainSwapStates::SwapExpired => "swap.expired".to_string(),
@@ -2722,6 +2726,7 @@ impl FromStr for ChainSwapStates {
             "transaction.confirmed" => Ok(ChainSwapStates::TransactionConfirmed),
             "transaction.server.mempool" => Ok(ChainSwapStates::TransactionServerMempool),
             "transaction.server.confirmed" => Ok(ChainSwapStates::TransactionServerConfirmed),
+            "transaction.claim.pending" => Ok(ChainSwapStates::TransactionClaimPending),
             "transaction.claimed" => Ok(ChainSwapStates::TransactionClaimed),
             "transaction.lockupFailed" => Ok(ChainSwapStates::TransactionLockupFailed),
             "swap.expired" => Ok(ChainSwapStates::SwapExpired),

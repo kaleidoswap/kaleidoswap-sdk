@@ -603,7 +603,9 @@ impl BtcSwapTx {
 
         let address = Address::from_str(&claim_address)?;
 
-        address.is_valid_for_network(bitcoin_client.network().into());
+        if !address.is_valid_for_network(bitcoin_client.network().into()) {
+            return Err(Error::Address("Address validation failed".to_string()));
+        }
 
         Ok(BtcSwapTx {
             kind: SwapTxKind::Claim,
