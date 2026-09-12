@@ -415,10 +415,10 @@ or `cargo publish`, and `kaleidorg-swap-sdk` is unclaimed on crates.io.
 Consumers take it by tag:
 
 ```toml
-kaleidorg-swap-sdk = { git = "https://github.com/kaleidoswap/swap-sdk", tag = "v0.5.0" }
+kaleidorg-swap-sdk = { git = "https://github.com/kaleidoswap/swap-sdk", tag = "v0.6.0" }
 ```
 
-Pin the tag you actually want; `v0.5.0` is the latest published release at the
+Pin the tag you actually want; `v0.6.0` is the latest published release at the
 time of writing.
 
 The `repository`, `homepage`, and `include` metadata on the manifests exists so

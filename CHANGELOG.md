@@ -29,6 +29,11 @@ that existed, and the destination rode through the inner `HashMap`, so
 outcome. The same asymmetry meant adding a destination venue was free while
 adding a source venue required a release of this crate.
 
+`GetReversePairsResponse` had nothing to lose to the bug, then, but it moves
+to the same map anyway: one shape across the three pair endpoints, and a
+source venue added to reverse later cannot reintroduce the same silent drop.
+That makes it a breaking change for reverse callers too — see below.
+
 The outer level is now a map, so an unrecognised currency round-trips instead
 of vanishing. A new venue is a server-side change alone.
 
@@ -41,10 +46,12 @@ now resolve through the map, so Rust callers using those need no edit. A named
 field keeps the `#[uniffi::remote(Record)]` mirrors valid; the generated Python
 glue gains map-of-map converters and is regenerated in this release.
 
-**What breaks.** Direct field access. `response.btc`, `response.lbtc` and
-`response.lusdt` are replaced by `response.pairs`, keyed by the currency string
-the server sends, plus a `get(from, to)` lookup for currencies that have no
-named accessor:
+**What breaks.** Direct field access, on **all three** pair responses —
+`GetSubmarinePairsResponse` (`btc`, `lbtc`, `lusdt`),
+`GetChainPairsResponse` (`btc`, `lbtc`) and `GetReversePairsResponse` (`btc`).
+Each is replaced by a single `pairs` field, keyed by the currency string the
+server sends, plus a `get(from, to)` lookup for currencies that have no named
+accessor:
 
 ```rust
 // before
@@ -53,7 +60,17 @@ let pair = pairs.lusdt.get("BTC");
 let pair = pairs.get("L-USDT", "BTC");
 // or, unchanged
 let pair = pairs.get_lusdt_to_btc_pair();
+
+// reverse breaks the same way
+let pair = reverse_pairs.btc.get("L-USDT");     // before
+let pair = reverse_pairs.get("BTC", "L-USDT");  // after
 ```
+
+This surfaces differently per language. Rust callers get a compile error.
+Python callers get a runtime `AttributeError`: the uniffi records are
+regenerated, so `response.btc` is simply gone and `response.pairs` — a
+`dict[str, dict[str, Pair]]` — takes its place. JavaScript callers are
+unaffected, as above.
 
 `GetNodesResponse` has the same shape and is deliberately left alone: the
 maker serves exactly one currency there, so nothing is being dropped, and
@@ -61,10 +78,15 @@ changing it would break callers for no gain.
 
 ### Breaking — Arkade swap phases gained a `failed` state
 
-`@arkade-os/swap` moves from `^0.0.3` to `^0.0.14` (`@arkade-os/sdk`
-`>=0.4.71 <0.5.0`), and `ArkadeIntentsVenue` now wraps that line's own
-`RfqSwapManager` instead of hand-rolling the same phase/reconcile state machine
-— chain polling, claim and refund dispatch, terminal-state bookkeeping.
+`@arkade-os/swap` moves from `^0.0.3` to `^0.0.14`, and `ArkadeIntentsVenue`
+now wraps that line's own `RfqSwapManager` instead of hand-rolling the same
+phase/reconcile state machine — chain polling, claim and refund dispatch,
+terminal-state bookkeeping.
+
+Both are optional peer dependencies, so this only affects callers who install
+them. The `@arkade-os/sdk` floor moves with it, `>=0.4.60 <0.5.0` to
+`>=0.4.71 <0.5.0`: a caller pinned between `0.4.60` and `0.4.70` has to move
+up to `0.4.71` or later to satisfy the peer range.
 
 `ArkadeSwapPhase` and `ReconcileReport` each gain a `"failed"` value: an action
 that kept failing until its window closed, which the previous hand-rolled loop
